@@ -459,9 +459,45 @@ IMPORTANT:
 
             // Case B: Try AI logic (same as App.jsx)
             const aiItem = aiLogic[idx];
-            if (aiItem && aiItem.formula) {
+            if (aiItem) {
+                console.log(`AI Item for line ${idx}:`, aiItem);
                 try {
-                    let parsable = aiItem.formula;
+                    // Handle header/note types first
+                    if (aiItem.type === 'header' || aiItem.type === 'note') {
+                        finalResults[idx] = {
+                            value: null,
+                            formatted: '',
+                            type: aiItem.type,
+                            explanation: aiItem.explanation,
+                            formula: '',
+                            source: 'ai'
+                        };
+                        return;
+                    }
+
+                    // Get parsable formula - could be in formula or value field
+                    let parsable = aiItem.formula || '';
+                    const aiValue = aiItem.value;
+
+                    // If value is a string with operators, use it as formula
+                    if (typeof aiValue === 'string' && /[+\-*/()]/.test(aiValue)) {
+                        parsable = aiValue;
+                    } else if (typeof aiValue === 'number') {
+                        // Direct numeric value from AI
+                        finalResults[idx] = {
+                            value: aiValue,
+                            type: aiItem.type || 'variable',
+                            format: aiItem.format || 'number',
+                            expression: aiItem.formula,
+                            explanation: aiItem.explanation,
+                            source: 'ai'
+                        };
+                        currentValues[idx] = aiValue;
+                        if (aiItem.formula) variableValues[aiItem.formula] = aiValue;
+                        return;
+                    }
+
+                    if (!parsable) return;
 
                     // If formula contains "=", take only the right side (the expression)
                     if (parsable.includes('=')) {
@@ -469,15 +505,13 @@ IMPORTANT:
                         parsable = parsable.slice(eqIdx + 1).trim();
                     }
 
-                    // Handle header/note types - show explanation only, no calculation
-                    if (['header', 'note', 'variable'].includes(parsable.toLowerCase()) || aiItem.type === 'header' || aiItem.type === 'note') {
+                    // Handle variable type - show explanation only
+                    if (parsable.toLowerCase() === 'variable' || parsable.toLowerCase() === 'header' || parsable.toLowerCase() === 'note') {
                         if (aiItem.explanation) {
                             finalResults[idx] = {
                                 value: null,
-                                formatted: '',
                                 type: aiItem.type,
                                 explanation: aiItem.explanation,
-                                formula: '',
                                 source: 'ai'
                             };
                         }

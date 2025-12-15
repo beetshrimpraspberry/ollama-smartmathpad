@@ -75,6 +75,12 @@ const DebugPanel = ({ isOpen, onClose, serverStatus, lastInput, lastOutput }) =>
 
                 <div className="flex items-center gap-2">
                     <button
+                        onClick={() => handleCopy({ input: lastInput, output: lastOutput, logs })}
+                        className="px-2 py-1 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 rounded transition-colors flex items-center gap-1"
+                    >
+                        <Copy className="w-3 h-3" /> Copy All
+                    </button>
+                    <button
                         onClick={loadLogs}
                         className="px-2 py-1 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 rounded transition-colors"
                     >
@@ -137,8 +143,8 @@ const DebugPanel = ({ isOpen, onClose, serverStatus, lastInput, lastOutput }) =>
                         <div
                             key={log.id}
                             className={`p-2 rounded cursor-pointer transition-colors ${log.type === 'error' ? 'bg-red-500/10 border border-red-500/20' :
-                                    log.type === 'llm' ? 'bg-blue-500/5 border border-zinc-800' :
-                                        'bg-zinc-900 border border-zinc-800'
+                                log.type === 'llm' ? 'bg-blue-500/5 border border-zinc-800' :
+                                    'bg-zinc-900 border border-zinc-800'
                                 }`}
                             onClick={() => toggleExpand(log.id)}
                         >
@@ -146,8 +152,8 @@ const DebugPanel = ({ isOpen, onClose, serverStatus, lastInput, lastOutput }) =>
                                 <div className="flex items-center gap-2">
                                     <span className="text-zinc-600">{formatTime(log.timestamp)}</span>
                                     <span className={`font-medium ${log.type === 'error' ? 'text-red-400' :
-                                            log.type === 'llm' ? 'text-blue-400' :
-                                                'text-zinc-400'
+                                        log.type === 'llm' ? 'text-blue-400' :
+                                            'text-zinc-400'
                                         }`}>
                                         [{log.type.toUpperCase()}]
                                     </span>
