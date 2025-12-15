@@ -92,11 +92,9 @@ const NeoCalcUI = () => {
             // Load files from IndexedDB
             let dbFiles = await getAllFiles();
 
-            // If no files exist, create sample files
+            // If no files exist, create a blank file to start
             if (dbFiles.length === 0) {
-                for (const mock of MOCK_FILES) {
-                    await createFile(mock.title, mock.content);
-                }
+                await createFile('Untitled.calc', '# New Document\n\n');
                 dbFiles = await getAllFiles();
             }
 
