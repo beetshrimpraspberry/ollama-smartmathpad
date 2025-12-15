@@ -1,408 +1,779 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Sparkles, RefreshCcw, Moon, Sun, Calculator, Variable, Sigma, Server, Zap } from 'lucide-react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { Sparkles, RefreshCcw, Moon, Sun, Calculator, Variable, Sigma, ArrowLeftRight, ArrowRight, Cloud, Zap } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import 'react-grab'; // Import as side-effect to trigger auto-init
+import 'react-grab'; // Dev tool import
 
-/* --- LOCAL LLM CONFIGURATION --- 
-   Ensure your local server is running.
-   Example: ./llama-server -m model.gguf --port 8080 -c 4096
-*/
+/* --- LOCAL LLM CONFIGURATION --- */
+/* --- LOCAL LLM CONFIGURATION --- */
 const LOCAL_API_URL = "http://localhost:8080/v1/chat/completions";
 
 const SoulverClone = () => {
     // --- STATE ---
-    const [text, setText] = useState('Trip Budget 🇯🇵\n\nFlight: $1,200\nHotel: $900 (1 night)\nRuba, Aadithya, and Nidhi are going\n\nSplit evenly per person');
+    const [text, setText] = useState('# Try variables and tagging\nRent = $2,400\nGroceries: 150 #food\nDining: 80 #food\n\nsum: food\n\n# Natural language (AI)\nSplit evenly per person');
 
-    // aiLogic: The "Blueprint" returned by the LLM. Maps lineIndex -> { formula, type, format }
+    // aiLogic: Logic extracted by LLM
     const [aiLogic, setAiLogic] = useState({});
 
-    // computedResults: The final calculated values. Maps lineIndex -> { value, formatted, expression }
+    // computedResults: The final merged values to display.
     const [computedResults, setComputedResults] = useState({});
 
     const [loading, setLoading] = useState(false);
+    const [serverStatus, setServerStatus] = useState('unknown'); // local server status
     const [isDarkMode, setIsDarkMode] = useState(false);
-    const [serverStatus, setServerStatus] = useState('unknown'); // 'connected', 'error', 'unknown'
 
     // --- REFS ---
     const textareaRef = useRef(null);
     const resultsRef = useRef(null);
     const highlightRef = useRef(null);
 
-    // --- API LOGIC (LOCAL LLM) ---
+    // --- CONSTANTS ---
+    const ROW_HEIGHT = 32;
+    const FONT_SIZE = 16;
+    const PADDING = 24;
+
+    // ==========================================
+    // 1. LOCAL SOULVER ENGINE (Regex/Eval)
+    // ==========================================
+
+    const SAFE_FUNCS = {
+        sqrt: Math.sqrt, abs: Math.abs, min: Math.min, max: Math.max,
+        round: (x, d = 0) => { const p = Math.pow(10, d); return Math.round(x * p) / p; },
+        floor: Math.floor, ceil: Math.ceil, pow: Math.pow, log: Math.log, exp: Math.exp,
+    };
+
+    const stripInlineComment = (line) => {
+        // Removes // comments and # comments (if not followed by a word char, e.g. # tag)
+        const idx = line.search(/\s#(?!\w)/);
+        if (idx >= 0) return line.slice(0, idx).trimEnd();
+        const idx2 = line.indexOf('//');
+        if (idx2 >= 0) return line.slice(0, idx2).trimEnd();
+        return line;
+    };
+
+    // Helper to remove #tags from the expression so math evaluation works
+    const removeTags = (line) => {
+        return line.replace(/#([A-Za-z][\w-]*)/g, '').trim();
+    };
+
+    const extractTag = (line) => {
+        const m1 = line.match(/\btag\s*:\s*([A-Za-z][\w-]*)/i);
+        if (m1) return m1[1].toLowerCase();
+        const m2 = line.match(/#([A-Za-z][\w-]*)/);
+        if (m2) return m2[1].toLowerCase();
+        return null;
+    };
+
+    const normalizeVarName = (raw) => raw.trim().replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || null;
+
+    const tokenizeNaturalGlue = (expr) => {
+        const glue = ['per', 'of', 'on', 'at', 'for', 'a', 'an', 'the', 'is', 'equals', 'equal'];
+        const re = new RegExp('\\b(' + glue.join('|') + ')\\b', 'gi');
+        return expr.replace(re, ' ');
+    };
+
+    const preprocessExpression = (expr) => {
+        let s = expr.trim();
+        s = s.replace(/×/g, '*').replace(/÷/g, '/').replace(/−/g, '-');
+        s = s.replace(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)/g, (_, num) => String(num).replace(/,/g, ''));
+        s = s.replace(/([0-9]+(?:\.[0-9]+)?)\s*%/g, '($1/100)');
+        s = s.replace(/\^/g, '**');
+        s = tokenizeNaturalGlue(s);
+        return s.replace(/\s+/g, ' ').trim();
+    };
+
+    const looksLikeMath = (s) => /[0-9$%]/.test(s) || /[+\-*/^()]/.test(s) || /\b(sqrt|abs|min|max|round|floor|ceil|pow|log|exp)\s*\(/i.test(s);
+
+    const buildEvaluator = (scope) => {
+        const names = [...Object.keys(SAFE_FUNCS), ...Object.keys(scope)];
+        const values = [...Object.values(SAFE_FUNCS), ...Object.values(scope)];
+        return (expr) => {
+            try {
+                const code = '"use strict"; return (' + expr + ');';
+                // eslint-disable-next-line no-new-func
+                const fn = Function(...names, code);
+                return fn(...values);
+            } catch (e) { return null; }
+        };
+    };
+
+    const classifyFormat = (rawLine) => /\$/.test(rawLine) ? 'currency' : 'number';
+
+    const evaluateDocument = (fullText) => {
+        const lines = fullText.split('\n');
+        const scope = Object.create(null);
+        const lineValues = [];
+        const lineTags = [];
+        const results = {}; // key: lineIndex
+
+        for (let i = 0; i < lines.length; i++) {
+            const raw = lines[i];
+            const trimmed = raw.trim();
+
+            // 1. Skip empty/comments
+            if (!trimmed || trimmed.startsWith('//')) {
+                lineValues.push(null);
+                lineTags.push(extractTag(raw));
+                continue;
+            }
+
+            // 2. Sum: Tag
+            const sumMatch = trimmed.match(/^sum\s*:\s*([A-Za-z][\w-]*)\s*$/i);
+            if (sumMatch) {
+                const tag = sumMatch[1].toLowerCase();
+                let sum = 0;
+                let count = 0;
+                for (let j = 0; j < i; j++) {
+                    if (lineTags[j] === tag && Number.isFinite(lineValues[j])) {
+                        sum += lineValues[j];
+                        count++;
+                    }
+                }
+                results[i] = {
+                    value: sum,
+                    type: 'total',
+                    format: 'number',
+                    explanation: count ? `Sum of #${tag}` : `No #${tag} found`,
+                    formula: `sum(${tag})`,
+                    source: 'local'
+                };
+                lineValues.push(sum);
+                lineTags.push(tag);
+                continue;
+            }
+
+            // 3. Assignment: Name = Expr
+            const eqIdx = trimmed.indexOf('=');
+            let isAssignment = false;
+
+            if (eqIdx > 0) {
+                const left = trimmed.slice(0, eqIdx);
+                const right = trimmed.slice(eqIdx + 1);
+                const varId = normalizeVarName(left);
+
+                if (varId && right.trim()) {
+                    // Remove comments AND tags before evaluating expression
+                    const exprRaw = removeTags(stripInlineComment(right));
+                    const expr = preprocessExpression(exprRaw);
+                    const evalFn = buildEvaluator(scope);
+                    const val = evalFn(expr);
+
+                    if (Number.isFinite(val)) {
+                        scope[varId] = val;
+                        results[i] = {
+                            value: val,
+                            type: 'variable',
+                            format: classifyFormat(raw),
+                            explanation: `Set ${left.trim()}`,
+                            formula: exprRaw.trim(),
+                            source: 'local'
+                        };
+                        lineValues.push(val);
+                        lineTags.push(extractTag(raw));
+                        isAssignment = true;
+                    }
+                }
+            }
+
+            if (isAssignment) continue;
+
+            // 3.5. Explicit Label: Expression (e.g. "Flight: 1200")
+            const colonIdx = trimmed.indexOf(':');
+            if (colonIdx > 0) {
+                const left = trimmed.slice(0, colonIdx);
+                const right = trimmed.slice(colonIdx + 1);
+
+                // Remove tags from the right side so "150 #food" becomes "150"
+                const exprRaw = removeTags(stripInlineComment(right));
+                const expr = preprocessExpression(exprRaw);
+
+                if (looksLikeMath(expr)) {
+                    const evalFn = buildEvaluator(scope);
+                    const val = evalFn(expr);
+                    if (Number.isFinite(val)) {
+                        results[i] = {
+                            value: val,
+                            type: 'calc',
+                            format: classifyFormat(raw),
+                            explanation: left.trim(),
+                            formula: exprRaw.trim(),
+                            source: 'local'
+                        };
+                        lineValues.push(val);
+                        lineTags.push(extractTag(raw));
+                        continue;
+                    }
+                }
+            }
+
+            // 4. Standard Expression or Text
+            const exprRaw = removeTags(stripInlineComment(raw));
+            const expr = preprocessExpression(exprRaw);
+            const tag = extractTag(raw);
+
+            if (looksLikeMath(expr)) {
+                const evalFn = buildEvaluator(scope);
+                const val = evalFn(expr);
+
+                if (Number.isFinite(val)) {
+                    results[i] = {
+                        value: val,
+                        type: /\btotal\b/i.test(raw) ? 'total' : 'calc',
+                        format: classifyFormat(raw),
+                        explanation: tag ? `Tagged #${tag}` : '',
+                        formula: exprRaw.trim(),
+                        source: 'local'
+                    };
+                    lineValues.push(val);
+                    lineTags.push(tag);
+                    continue;
+                }
+            }
+
+            // Fallback: Text line (no value)
+            lineValues.push(null);
+            lineTags.push(tag);
+        }
+
+        return results;
+    };
+
+    // ==========================================
+    // 2. API LOGIC (LOCAL LLM)
+    // ==========================================
+    // --- DEBUGGING ---
+    const [debugInfo, setDebugInfo] = useState({ lastError: null, lastResponse: null, url: LOCAL_API_URL });
+    const [showDebug, setShowDebug] = useState(false);
+
+    // ==========================================
+    // 2. API LOGIC (LOCAL LLM)
+    // ==========================================
     const callLocalLLM = async (inputText) => {
         if (!inputText.trim()) {
             setAiLogic({});
+            setServerStatus('unknown');
             return;
         }
+        setLoading(true);
+        setServerStatus('connecting...');
+        setDebugInfo(prev => ({ ...prev, lastError: null }));
 
-        // Convert raw text to line-indexed JSON
+        // Build line map and extract variables
+        const lineMap = {};
+        const variables = {}; // { varName: { line: idx, value: number } }
         const lines = inputText.split('\n');
-        const inputMap = {};
-        lines.forEach((line, index) => {
+
+        lines.forEach((line, idx) => {
             if (line.trim()) {
-                inputMap[index.toString()] = line;
+                lineMap[idx] = line;
+
+                // Extract variable assignments (e.g., "Rent = $2400")
+                const eqIdx = line.indexOf('=');
+                if (eqIdx > 0) {
+                    const varName = line.slice(0, eqIdx).trim();
+                    const rightSide = line.slice(eqIdx + 1).trim();
+                    // Try to parse the value
+                    const numMatch = rightSide.match(/\$?\s*([\d,]+(?:\.\d+)?)/);
+                    if (numMatch) {
+                        const value = parseFloat(numMatch[1].replace(/,/g, ''));
+                        if (!isNaN(value)) {
+                            variables[varName] = { line: idx, value };
+                        }
+                    }
+                }
+
+                // Extract labeled values (e.g., "Groceries: 150")
+                const colonIdx = line.indexOf(':');
+                if (colonIdx > 0 && !line.match(/^(sum|tag)\s*:/i)) {
+                    const label = line.slice(0, colonIdx).trim();
+                    const rightSide = line.slice(colonIdx + 1).trim();
+                    const numMatch = rightSide.match(/\$?\s*([\d,]+(?:\.\d+)?)/);
+                    if (numMatch) {
+                        const value = parseFloat(numMatch[1].replace(/,/g, ''));
+                        if (!isNaN(value)) {
+                            variables[label] = { line: idx, value };
+                        }
+                    }
+                }
             }
         });
 
-        setLoading(true);
-        setServerStatus('unknown');
+        // Build enhanced input with variables context
+        const llmInput = {
+            lines: lineMap,
+            variables: variables
+        };
 
-        const systemPrompt = `
-      You are a Logic Extraction Engine. Do NOT calculate the final answers. 
-      Your job is to translate natural language into JavaScript-evaluable formulas.
+        // Store input for debugging
+        setDebugInfo(prev => ({ ...prev, lastInput: JSON.stringify(llmInput, null, 2) }));
 
-      INPUT: JSON object where keys are 0-indexed line numbers and values are the text lines.
-      OUTPUT: JSON object where keys are the SAME 0-indexed line numbers.
+        const systemPrompt = `You are a Logic Extraction Engine for a smart calculator.
 
-      JSON SCHEMA per line:
-      {
-        "formula": "Math expression string. Use 'L{n}' to refer to the result of line n (e.g. 'L0 + L1'). Use javascript math (Math.pow, etc)",
-        "type": "value" | "calc" | "total" | "variable",
-        "format": "currency" | "number" | "percent",
-        "explanation": "Brief natural language explanation of the logic (e.g. 'Sum of expenses', 'Split per person', 'Rent cost')"
-      }
+INPUT FORMAT:
+{
+  "lines": { "lineIndex": "text content" },
+  "variables": { "VarName": { "line": lineIndex, "value": number } }
+}
 
-      RULES:
-      1. **Strict Indexing**: If input has key "5", output logic MUST be at key "5". Do not shift lines.
-      2. **Extraction**: If a line says "Flight $1200", formula is "1200", explanation is "Flight cost".
-      3. **Implicit Values**: If a line says "Tax is 5%", formula is "0.05", explanation is "Tax rate". Extract numbers even if implicit.
-      4. **Counting**: If a line lists items or names (e.g. "Ruba, Aadithya, and Nidhi"), formula is the count (e.g. "3").
-      5. **Logic**: If a line says "3 people * $50", formula is "3 * 50", explanation is "3 people × $50".
-      5. **References**: If line 2 says "Total", and lines 0 and 1 are numbers, formula is "L0 + L1", explanation is "Sum of above".
-      6. **Splitting**: If line 3 says "Split by 3", formula is "L2 / 3", explanation is "Split by 3 people".
-      7. **Safety**: Return ONLY the JSON. No Markdown.
+OUTPUT FORMAT:
+{ "lineIndex": { "formula": string, "type": string, "format": string, "explanation": string } }
 
-      EXAMPLE INPUT:
-      {
-        "0": "Salary $5000",
-        "1": "Rent $1200",
-        "2": "Leftover"
-      }
+RULES:
+1. **Use Variable Names**: If a variable exists, use its name in formulas (e.g., "Rent + Utilities") instead of line refs.
+2. **Line References**: Use L{n} for lines without variable names, or L{prev} for previous line.
+3. **Implicit Values**: "Tax is 5%" → formula "0.05".
+4. **Natural Language Math**: 
+   - "Split evenly" or "per person" → divide by number of people (default 2 if not specified)
+   - "What's left" or "remaining" → subtract from total
+   - "Double" → multiply by 2
+   - "Half" → divide by 2
+5. **Types**: "variable", "formula", "total", "header", "note"
+6. **Explanations**: Concise labels describing what the line calculates.
 
-      EXAMPLE OUTPUT:
-      {
-        "0": { "formula": "5000", "type": "value", "format": "currency", "explanation": "Salary income" },
-        "1": { "formula": "1200", "type": "variable", "format": "currency", "explanation": "Rent deduction" },
-        "2": { "formula": "L0 - L1", "type": "calc", "format": "currency", "explanation": "Net remaining" }
-      }
-    `;
+IMPORTANT: 
+- Natural language like "Split evenly per person" MUST produce a formula (e.g., "L{prev} / 2"), NOT a note.
+- Only mark as "note" if line is pure comment with no calculation intent.
+- Return ONLY valid JSON. Use variable names when available.`;
 
         try {
             const response = await fetch(LOCAL_API_URL, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     model: "gpt-3.5-turbo",
                     messages: [
                         { role: "system", content: systemPrompt },
-                        { role: "user", content: JSON.stringify(inputMap) }
+                        { role: "user", content: JSON.stringify(llmInput) }
                     ],
                     temperature: 0.1,
-                    response_format: { type: "json_object" }
+                    stream: true // Enable streaming
                 }),
             });
 
             if (!response.ok) {
-                throw new Error("Local Server Error");
+                const errText = await response.text();
+                throw new Error(`HTTP ${response.status}: ${errText}`);
             }
 
-            const data = await response.json();
-            const textResult = data.choices?.[0]?.message?.content;
+            setServerStatus('connected');
 
-            if (textResult) {
-                setServerStatus('connected');
-                const jsonResult = JSON.parse(textResult);
-                setAiLogic(jsonResult);
+            // Read the stream
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let fullContent = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value, { stream: true });
+                const lines = chunk.split('\n');
+
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const data = line.slice(6);
+                        if (data === '[DONE]') continue;
+
+                        try {
+                            const parsed = JSON.parse(data);
+                            const delta = parsed.choices?.[0]?.delta?.content || '';
+                            fullContent += delta;
+
+                            // Try to parse partial JSON and update UI
+                            // We attempt to "close" the JSON by adding missing braces
+                            try {
+                                let testJson = fullContent;
+                                // Count open braces and try to close them
+                                const openBraces = (testJson.match(/{/g) || []).length;
+                                const closeBraces = (testJson.match(/}/g) || []).length;
+                                for (let i = 0; i < openBraces - closeBraces; i++) {
+                                    testJson += '}';
+                                }
+                                const partialLogic = JSON.parse(testJson);
+                                setAiLogic(partialLogic);
+                            } catch {
+                                // Still incomplete, wait for more
+                            }
+                        } catch {
+                            // Skip malformed chunks
+                        }
+                    }
+                }
             }
+
+            setDebugInfo(prev => ({ ...prev, lastResponse: fullContent }));
+
+            // Final parse
+            try {
+                setAiLogic(JSON.parse(fullContent));
+            } catch {
+                setDebugInfo(prev => ({ ...prev, lastError: "Invalid JSON from LLM" }));
+            }
+
         } catch (err) {
             console.error("LLM API Error:", err);
             setServerStatus('error');
+            setDebugInfo(prev => ({ ...prev, lastError: err.message || String(err) }));
         } finally {
             setLoading(false);
         }
     };
 
-    // --- CALCULATION ENGINE (CLIENT SIDE) ---
-    // This runs whenever aiLogic updates. It computes the actual numbers.
+    // ==========================================
+    // 3. ORCHESTRATOR & RENDER LOGIC
+    // ==========================================
+
     useEffect(() => {
-        const results = {};
-        const lineIndices = Object.keys(aiLogic).sort((a, b) => parseInt(a) - parseInt(b));
+        const localResults = evaluateDocument(text);
 
-        lineIndices.forEach(idx => {
-            const item = aiLogic[idx];
-            let val = 0;
+        const finalResults = {};
+        const lines = text.split('\n');
+        const currentValues = {};
+        Object.keys(localResults).forEach(k => currentValues[k] = localResults[k].value);
 
-            try {
-                // Replace L{n} with actual values from previous lines
-                const parsableFormula = item.formula.replace(/L(\d+)/g, (match, lineNum) => {
-                    const refVal = results[lineNum]?.value;
-                    return refVal !== undefined ? refVal : 0;
-                });
-
-                // Safe evaluation
-                // eslint-disable-next-line no-new-func
-                val = new Function(`return (${parsableFormula})`)();
-
-                // Formatting
-                let formatted = val;
-                if (typeof val === 'number') {
-                    if (item.format === 'currency') {
-                        formatted = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val);
-                    } else if (item.format === 'percent') {
-                        formatted = val + '%';
-                    } else {
-                        formatted = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(val);
-                    }
+        // Build a variable lookup map from local results
+        const variableValues = {}; // { "Rent": 2400, "Utilities": 180 }
+        lines.forEach((line, idx) => {
+            if (localResults[idx]) {
+                // Extract variable name from assignment (e.g., "Rent = $2400" -> "Rent")
+                const eqIdx = line.indexOf('=');
+                if (eqIdx > 0) {
+                    const varName = line.slice(0, eqIdx).trim();
+                    variableValues[varName] = localResults[idx].value;
                 }
-
-                results[idx] = {
-                    value: val,
-                    formatted: formatted,
-                    type: item.type,
-                    expression: item.formula, // Store the raw formula
-                    explanation: item.explanation // Store the human explanation
-                };
-
-            } catch (e) {
-                console.warn(`Error evaluating line ${idx}:`, e);
-                results[idx] = { value: 0, formatted: "Error", type: "error", expression: "Invalid Logic", explanation: "Error" };
+                // Extract label from colon syntax (e.g., "Groceries: 150" -> "Groceries")
+                const colonIdx = line.indexOf(':');
+                if (colonIdx > 0 && !line.match(/^(sum|tag)\s*:/i)) {
+                    const label = line.slice(0, colonIdx).trim();
+                    variableValues[label] = localResults[idx].value;
+                }
             }
         });
 
-        setComputedResults(results);
-    }, [aiLogic]);
+        lines.forEach((_, idx) => {
+            let merged = null;
+            if (localResults[idx]) {
+                merged = {
+                    ...localResults[idx],
+                    formatted: formatValue(localResults[idx].value, localResults[idx].format),
+                    source: 'local'
+                };
+                finalResults[idx] = merged;
+                return;
+            }
 
-    // Debounce API calls - Reduced to 500ms for "live" feel
+            // Case B: AI Logic
+            const aiItem = aiLogic[idx];
+            if (aiItem && aiItem.formula) {
+                try {
+                    let parsable = aiItem.formula;
+
+                    // If formula contains "=", take only the right side (the expression)
+                    // e.g., "Total Fixed Costs = Venue Rental + Stage & Sound" -> "Venue Rental + Stage & Sound"
+                    if (parsable.includes('=')) {
+                        const eqIdx = parsable.indexOf('=');
+                        parsable = parsable.slice(eqIdx + 1).trim();
+                    }
+
+                    // Handle header/note types - show explanation only, no calculation
+                    if (['header', 'note', 'variable'].includes(parsable.toLowerCase()) || aiItem.type === 'header' || aiItem.type === 'note') {
+                        if (aiItem.explanation) {
+                            finalResults[idx] = {
+                                value: null,
+                                formatted: '',
+                                type: aiItem.type,
+                                explanation: aiItem.explanation,
+                                formula: '',
+                                source: 'ai'
+                            };
+                        }
+                        return;
+                    }
+
+                    // First, replace variable names with their values
+                    // Sort by length descending to avoid partial matches (e.g., "Rent" vs "Rent Total")
+                    const sortedVarNames = Object.keys(variableValues).sort((a, b) => b.length - a.length);
+                    for (const varName of sortedVarNames) {
+                        // Escape special regex chars and create pattern that handles spaces
+                        const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                        const regex = new RegExp(escaped, 'gi');
+                        parsable = parsable.replace(regex, variableValues[varName]);
+                    }
+
+                    // Handle L{prev} - replace with previous line's value
+                    parsable = parsable.replace(/L\{prev\}/gi, () => {
+                        // Find the closest previous line with a value
+                        for (let i = idx - 1; i >= 0; i--) {
+                            if (finalResults[i]?.value !== undefined) return finalResults[i].value;
+                            if (currentValues[i] !== undefined) return currentValues[i];
+                        }
+                        return 0;
+                    });
+
+                    // Handle L{digit} with curly braces (e.g., L{2}, L{10})
+                    parsable = parsable.replace(/L\{(\d+)\}/g, (_, lineNum) => {
+                        const v = finalResults[lineNum]?.value ?? currentValues[lineNum] ?? 0;
+                        return v;
+                    });
+
+                    // Handle L followed by number without braces (e.g., L5)
+                    parsable = parsable.replace(/L(\d+)/g, (_, lineNum) => {
+                        const v = finalResults[lineNum]?.value ?? currentValues[lineNum] ?? 0;
+                        return v;
+                    });
+
+                    // Handle sum(tag) - sum all values with that tag
+                    parsable = parsable.replace(/sum\((\w+)\)/gi, (_, tag) => {
+                        // For now, just use 0 - the local engine handles sum() better
+                        return 0;
+                    });
+
+                    // Handle math functions the AI might use
+                    parsable = parsable.replace(/sqrt\(([^)]+)\)/gi, (_, arg) => `Math.sqrt(${arg})`);
+                    parsable = parsable.replace(/round\(([^,]+),\s*(\d+)\)/gi, (_, num, dec) => `(Math.round(${num} * Math.pow(10, ${dec})) / Math.pow(10, ${dec}))`);
+                    parsable = parsable.replace(/max\(([^)]+)\)/gi, (_, args) => `Math.max(${args})`);
+                    parsable = parsable.replace(/min\(([^)]+)\)/gi, (_, args) => `Math.min(${args})`);
+
+                    // Skip if formula is empty or non-numeric
+                    if (!parsable || parsable === '' || parsable === '0') {
+                        return;
+                    }
+
+                    // eslint-disable-next-line no-new-func
+                    const val = new Function(`return (${parsable})`)();
+
+                    if (Number.isFinite(val)) {
+                        finalResults[idx] = {
+                            value: val,
+                            formatted: formatValue(val, aiItem.format),
+                            type: aiItem.type,
+                            explanation: aiItem.explanation,
+                            formula: aiItem.formula,
+                            source: 'ai'
+                        };
+                        currentValues[idx] = val;
+
+                        // Also add computed result to variableValues so later formulas can use it
+                        // Extract variable name from left side of "=" in original formula
+                        const originalFormula = aiItem.formula;
+                        if (originalFormula.includes('=')) {
+                            const computedVarName = originalFormula.slice(0, originalFormula.indexOf('=')).trim();
+                            if (computedVarName) {
+                                variableValues[computedVarName] = val;
+                            }
+                        }
+                    }
+                } catch (e) { /* ignore */ }
+            }
+        });
+
+        setComputedResults(finalResults);
+    }, [text, aiLogic]); // This effect only MERGES results, doesn't call LLM
+
+    // Separate useEffect for debounced LLM call - only depends on text
     useEffect(() => {
-        const timer = setTimeout(() => {
-            callLocalLLM(text);
-        }, 500);
+        const timer = setTimeout(() => callLocalLLM(text), 800);
         return () => clearTimeout(timer);
-    }, [text]);
+    }, [text]); // Only re-call LLM when text changes, NOT when aiLogic changes
 
-    // --- SCROLL SYNC ---
-    const handleScroll = (e) => {
-        const scrollTop = e.target.scrollTop;
-        if (resultsRef.current) resultsRef.current.scrollTop = scrollTop;
-        if (highlightRef.current) highlightRef.current.scrollTop = scrollTop;
-        if (highlightRef.current) highlightRef.current.scrollLeft = e.target.scrollLeft;
+    // Helper formatter
+    const formatValue = (val, format) => {
+        if (!Number.isFinite(val)) return '';
+        if (format === 'currency') return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val);
+        if (format === 'percent') return (val * 100).toLocaleString(undefined, { maximumFractionDigits: 2 }) + '%';
+        return val.toLocaleString(undefined, { maximumFractionDigits: 2 });
     };
 
-    // --- SYNTAX HIGHLIGHTING ---
+    // --- UI HELPERS ---
+    const handleScroll = (e) => {
+        if (resultsRef.current) resultsRef.current.scrollTop = e.target.scrollTop;
+        if (highlightRef.current) {
+            highlightRef.current.scrollTop = e.target.scrollTop;
+            highlightRef.current.scrollLeft = e.target.scrollLeft;
+        }
+    };
+
     const getHighlightedText = (content) => {
         let safeText = content.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-        // Slightly richer highlighting
         safeText = safeText.replace(/(\d{1,3}(,\d{3})*(\.\d+)?)/g, '%%%NUM%%%$1%%%END%%%');
-        safeText = safeText.replace(/(\$|€|£|¥|₹)/g, '%%%CUR%%%$1%%%END%%%');
-        safeText = safeText.replace(/(\+|\-|\*|\/|=)/g, '%%%OP%%%$1%%%END%%%');
-        safeText = safeText.replace(/\b(Total|Sum|Budget|Cost|Split|Per person|remaining|left|plus|minus|times|divided)\b/gi, '%%%KEY%%%$1%%%END%%%');
+        safeText = safeText.replace(/([#][a-zA-Z0-9_]+)/g, '%%%TAG%%%$1%%%END%%%');
 
-        safeText = safeText
+        return safeText
             .replace(/%%%NUM%%%/g, '<span class="text-blue-500 font-bold">')
-            .replace(/%%%CUR%%%/g, '<span class="text-green-600 font-bold">')
-            .replace(/%%%OP%%%/g, '<span class="text-purple-400 font-bold">')
-            .replace(/%%%KEY%%%/g, '<span class="text-orange-500 font-semibold">')
-            .replace(/%%%END%%%/g, '</span>');
-
-        return safeText + '<br>';
+            .replace(/%%%TAG%%%/g, '<span class="text-purple-400 font-medium">')
+            .replace(/%%%END%%%/g, '</span>') + '<br>';
     };
 
-    const lines = text.split('\n');
-
-    // CONSTANTS for alignment
-    const ROW_HEIGHT = 40; // Increased for comfort
-    const FONT_SIZE = '16px';
-
     return (
-        <div className={`flex flex-col h-screen w-full transition-colors duration-500 font-sans tracking-tight ${isDarkMode ? 'bg-zinc-900 text-zinc-100' : 'bg-white text-zinc-900'}`}>
+        <div className={`flex flex-col h-screen w-full transition-colors duration-500 font-mono ${isDarkMode ? 'bg-[#1e1e1e] text-gray-300' : 'bg-white text-gray-800'}`}>
 
-            {/* --- HEADER --- */}
-            <header className={`flex-none h-14 flex items-center justify-between px-6 border-b z-30 transition-colors ${isDarkMode ? 'border-zinc-800 bg-zinc-900/50 backdrop-blur' : 'border-zinc-100 bg-white/80 backdrop-blur'}`}>
-                <div className="flex items-center gap-2.5 group cursor-default">
-                    <div className={`p-2 rounded-xl transition-all ${isDarkMode ? 'bg-blue-500/10 text-blue-400 group-hover:bg-blue-500/20' : 'bg-blue-50 text-blue-600 group-hover:bg-blue-100'}`}>
-                        <Sparkles className="w-5 h-5" />
-                    </div>
-                    <div className="flex flex-col">
-                        <span className="font-semibold text-sm leading-tight">Smart Sheet</span>
-                        <span className="text-[10px] opacity-50 font-medium leading-tight">Local Intelligence</span>
-                    </div>
+            {/* DEBUG MODAL */}
+            <AnimatePresence>
+                {showDebug && (
+                    <motion.div
+                        initial={{ opacity: 0, y: -20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -20 }}
+                        className="absolute top-16 right-6 z-50 w-96 bg-white dark:bg-[#252526] border border-zinc-200 dark:border-zinc-700 shadow-xl rounded-lg overflow-hidden text-xs"
+                    >
+                        <div className="p-3 border-b dark:border-zinc-700 font-semibold flex justify-between items-center">
+                            <span>LLM Debugger</span>
+                            <button onClick={() => setShowDebug(false)} className="hover:text-red-500">Close</button>
+                        </div>
+                        <div className="p-3 space-y-3">
+                            <div>
+                                <span className="block opacity-50 mb-1">API URL</span>
+                                <code className="block p-2 bg-zinc-100 dark:bg-zinc-800 rounded break-all">{debugInfo.url}</code>
+                            </div>
+
+                            {debugInfo.lastError && (
+                                <div>
+                                    <span className="block text-red-500 font-bold mb-1">Last Error</span>
+                                    <div className="p-2 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 rounded break-words">
+                                        {debugInfo.lastError}
+                                    </div>
+                                </div>
+                            )}
+
+                            <div>
+                                <span className="block opacity-50 mb-1">Last Response</span>
+                                <pre className="p-2 bg-zinc-100 dark:bg-zinc-800 rounded overflow-auto max-h-40">
+                                    {debugInfo.lastResponse || "No response yet"}
+                                </pre>
+                            </div>
+
+                            <button
+                                onClick={() => callLocalLLM(text)}
+                                className="w-full py-2 bg-blue-500 hover:bg-blue-600 text-white rounded font-medium"
+                            >
+                                Force Retry Connection
+                            </button>
+                        </div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            {/* HEADER */}
+            <header className={`flex-none h-14 flex items-center justify-between px-6 border-b z-30 ${isDarkMode ? 'border-gray-800 bg-[#252526]' : 'border-gray-100 bg-white'}`}>
+                <div className="flex items-center gap-2">
+                    <Calculator className={`w-5 h-5 ${isDarkMode ? 'text-blue-400' : 'text-blue-600'}`} />
+                    <span className="font-semibold tracking-tight text-sm">Smart Sheet</span>
                 </div>
 
                 <div className="flex items-center gap-3">
-                    {serverStatus === 'error' && (
-                        <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full bg-red-500/10 text-red-500 text-xs font-medium animate-pulse">
-                            <Server className="w-3 h-3" />
-                            <span>Check Server (:8080)</span>
-                        </div>
-                    )}
-
-                    {loading && (
-                        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-500/10 text-blue-500 text-xs font-medium">
-                            <RefreshCcw className="w-3 h-3 animate-spin" />
-                            <span className="hidden sm:inline">Processing...</span>
-                        </div>
-                    )}
-
                     <button
-                        onClick={() => setIsDarkMode(!isDarkMode)}
-                        className={`p-2 rounded-lg transition-all active:scale-95 ${isDarkMode ? 'hover:bg-zinc-800 text-zinc-400 hover:text-zinc-100' : 'hover:bg-zinc-100 text-zinc-500 hover:text-zinc-900'}`}
+                        onClick={() => setShowDebug(!showDebug)}
+                        className={`flex items-center gap-2 text-[10px] px-2 py-1 rounded-full transition-all duration-300 cursor-pointer hover:opacity-80 ${serverStatus === 'connected' ? (isDarkMode ? 'bg-green-900/30 text-green-400' : 'bg-green-100/50 text-green-600') : (isDarkMode ? 'bg-slate-800' : 'bg-slate-100')}`}
                     >
+                        {serverStatus === 'connected' ? (
+                            <Zap className="w-3 h-3" />
+                        ) : serverStatus === 'error' ? (
+                            <div className="w-2 h-2 rounded-full bg-red-500" />
+                        ) : (
+                            <div className="w-2 h-2 rounded-full bg-yellow-500 animate-pulse" />
+                        )}
+
+                        <span>{serverStatus === 'connected' ? 'Connected' : 'Connecting...'}</span>
+                        <span className="text-gray-300 opacity-50">|</span>
+                        <Cloud className={`w-3 h-3 ${loading ? 'text-blue-500 animate-pulse' : 'text-gray-400'}`} />
+                        <span>AI</span>
+                    </button>
+                    <button onClick={() => setIsDarkMode(!isDarkMode)} className={`p-1.5 rounded-md ${isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100'}`}>
                         {isDarkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
                     </button>
                 </div>
             </header>
 
-            {/* --- MAIN EDITOR AREA --- */}
+            {/* MAIN */}
             <div className="flex-1 flex overflow-hidden relative">
-
-                {/* LINE NUMBERS GUTTER */}
-                <div className={`w-12 flex-none pt-6 text-right pr-4 select-none text-xs font-mono opacity-30 ${isDarkMode ? 'text-zinc-500' : 'text-zinc-400'} bg-transparent transition-colors z-20`}>
-                    {lines.map((_, i) => (
-                        <div key={i} style={{ height: `${ROW_HEIGHT}px`, lineHeight: `${ROW_HEIGHT}px` }}>{i + 1}</div>
-                    ))}
-                </div>
-
-                {/* LEFT COLUMN: Input */}
-                <div className="flex-1 relative h-full group">
-                    {/* Syntax Highlighter Layer */}
+                {/* Editor */}
+                <div className="w-1/2 relative h-full border-r border-transparent">
                     <pre
                         ref={highlightRef}
-                        className={`absolute inset-0 pl-2 pr-6 pt-6 m-0 overflow-hidden whitespace-pre pointer-events-none z-0 ${isDarkMode ? 'text-zinc-300' : 'text-zinc-800'}`}
-                        style={{
-                            fontFamily: '"Menlo", "Consolas", monospace',
-                            fontSize: FONT_SIZE,
-                            lineHeight: `${ROW_HEIGHT}px`
-                        }}
+                        className={`absolute inset-0 m-0 overflow-hidden whitespace-pre pointer-events-none z-0 ${isDarkMode ? 'text-gray-300' : 'text-gray-800'}`}
+                        style={{ fontFamily: '"Menlo", monospace', fontSize: `${FONT_SIZE}px`, lineHeight: `${ROW_HEIGHT}px`, padding: `${PADDING}px` }}
                         dangerouslySetInnerHTML={{ __html: getHighlightedText(text) }}
                     />
-
-                    {/* Editable Textarea Layer */}
                     <textarea
                         ref={textareaRef}
                         value={text}
                         onChange={(e) => setText(e.target.value)}
                         onScroll={handleScroll}
                         spellCheck="false"
-                        autoCorrect="off"
-                        autoCapitalize="off"
-                        className={`absolute inset-0 w-full h-full pl-2 pr-6 pt-6 m-0 overflow-auto whitespace-pre resize-none bg-transparent text-transparent caret-blue-500 z-10 focus:outline-none selection:bg-blue-500/20`}
-                        style={{
-                            fontFamily: '"Menlo", "Consolas", monospace',
-                            fontSize: FONT_SIZE,
-                            lineHeight: `${ROW_HEIGHT}px`
-                        }}
-                        placeholder="Type your math here..."
+                        className={`absolute inset-0 w-full h-full m-0 overflow-auto whitespace-pre resize-none bg-transparent text-transparent caret-blue-500 z-10 focus:outline-none`}
+                        style={{ fontFamily: '"Menlo", monospace', fontSize: `${FONT_SIZE}px`, lineHeight: `${ROW_HEIGHT}px`, padding: `${PADDING}px` }}
                     />
                 </div>
 
-                {/* DRAGGABLE GUTTER (Visual only for now) */}
-                <div className={`w-px h-full z-20 ${isDarkMode ? 'bg-zinc-800' : 'bg-zinc-100'}`} />
-
-                {/* RIGHT COLUMN: Results & Logic */}
-                <div
-                    className={`w-[40%] h-full z-20 flex flex-col transition-colors ${isDarkMode ? 'bg-zinc-900/50' : 'bg-zinc-50/50'}`}
-                >
-                    <div
-                        ref={resultsRef}
-                        className="flex-1 overflow-hidden pt-6 pl-4 pr-6 text-right opacity-90"
-                    >
-                        {lines.map((_, index) => {
+                {/* Results */}
+                <div className={`w-1/2 h-full border-l z-20 flex flex-col ${isDarkMode ? 'bg-[#252526] border-gray-800' : 'bg-gray-50 border-gray-100'}`}>
+                    <div ref={resultsRef} className="flex-1 overflow-hidden opacity-90" style={{ fontFamily: '"Menlo", monospace', fontSize: `${FONT_SIZE}px`, padding: `${PADDING}px` }}>
+                        {text.split('\n').map((line, index) => {
                             const data = computedResults[index];
-                            const isWaiting = loading && !data;
+                            // If no data, but we are loading and line has content, show skeleton
+                            const isPending = loading && !data && line.trim().length > 0;
 
-                            // Empty placeholder row
-                            if (!data) {
-                                return (
-                                    <div key={index} className="flex items-center justify-end" style={{ height: `${ROW_HEIGHT}px` }}>
-                                        {isWaiting && index < lines.length && lines[index].trim() && (
-                                            <div className="h-2 w-12 bg-zinc-200 dark:bg-zinc-700/50 rounded-full animate-pulse" />
-                                        )}
-                                    </div>
-                                );
-                            }
+                            if (!data && !isPending) return <div key={index} className="w-full" style={{ height: `${ROW_HEIGHT}px` }}>&nbsp;</div>;
 
-                            // Logic for styling
-                            let ResultColor = isDarkMode ? 'text-zinc-400' : 'text-zinc-500';
+                            let ResultColor = isDarkMode ? 'text-gray-400' : 'text-gray-600';
+                            let ExprColor = isDarkMode ? 'text-gray-500' : 'text-gray-400';
                             let Icon = null;
 
-                            if (data.type === 'total') {
-                                ResultColor = isDarkMode ? 'text-blue-400 font-bold text-lg' : 'text-blue-600 font-bold text-lg';
-                                Icon = <Sigma className="w-3.5 h-3.5 mr-1.5 opacity-60" />;
-                            }
-                            else if (data.type === 'variable') {
-                                ResultColor = isDarkMode ? 'text-purple-400 font-medium' : 'text-purple-600 font-medium';
-                                Icon = <Variable className="w-3.5 h-3.5 mr-1.5 opacity-60" />;
-                            }
-                            else if (data.type === 'calc') {
-                                ResultColor = isDarkMode ? 'text-green-400 font-semibold' : 'text-green-600 font-semibold';
-                            }
+                            if (data?.type === 'total') { ResultColor = isDarkMode ? 'text-blue-400 font-bold' : 'text-blue-600 font-bold'; Icon = <Sigma className="w-3 h-3 mr-2 opacity-50" />; }
+                            else if (data?.type === 'variable') { ResultColor = isDarkMode ? 'text-purple-400 font-medium' : 'text-purple-600 font-medium'; Icon = <Variable className="w-3 h-3 mr-2 opacity-50" />; }
 
-                            // Format Formula
-                            const friendlyExpression = data.expression
-                                .replace(/L(\d+)/g, (_, line) => `Line ${parseInt(line) + 1}`)
-                                .replace(/\*/g, '×')
-                                .replace(/\//g, '÷');
+                            // Clean formula for display
+                            const displayFormula = data?.formula
+                                ? data.formula.replace(/L(\d+)/g, (_, l) => `Line ${parseInt(l) + 1}`).replace(/\*/g, '×').replace(/\//g, '÷')
+                                : '';
 
                             return (
-                                <div key={index} className="flex items-center justify-end group/row relative w-full" style={{ height: `${ROW_HEIGHT}px` }}>
+                                <div key={index} className="flex items-center justify-end w-full relative group px-6" style={{ height: `${ROW_HEIGHT}px` }}>
 
-                                    {/* Logic Explanation / Formula Preview */}
-                                    <AnimatePresence>
-                                        {(data.explanation || (data.expression && !data.expression.match(/^[\d.]+$/))) && (
-                                            <motion.div
-                                                initial={{ opacity: 0, x: 10 }}
-                                                animate={{ opacity: 1, x: 0 }}
-                                                exit={{ opacity: 0 }}
-                                                className={`mr-4 flex items-center justify-end text-xs tracking-tight ${isDarkMode ? 'text-zinc-600' : 'text-zinc-400'} flex-1 min-w-0`}
-                                            >
-                                                {/* Explanation */}
-                                                {data.explanation && (
-                                                    <span className="font-medium truncate shrink-0 max-w-[140px] hidden xl:inline-block">{data.explanation}</span>
+                                    {isPending ? (
+                                        <motion.div
+                                            initial={{ opacity: 0.3 }}
+                                            animate={{ opacity: [0.3, 0.6, 0.3] }}
+                                            transition={{ duration: 1.5, repeat: Infinity }}
+                                            className="w-24 h-4 rounded bg-gray-200 dark:bg-gray-700"
+                                        />
+                                    ) : (
+                                        <>
+                                            {(data.explanation) && (
+                                                <div className={`mr-4 flex items-center justify-end text-xs tracking-tight transition-all duration-500 ease-out ${ExprColor} flex-1 min-w-0 opacity-80 sm:opacity-100`}>
+
+                                                    {/* Source Indicator */}
+                                                    <div className="mr-2 opacity-50">
+                                                        {data.source === 'local' ? <Zap className="w-3 h-3 text-yellow-500" /> : <Cloud className="w-3 h-3 text-blue-400" />}
+                                                    </div>
+
+                                                    {/* Label */}
+                                                    <span className="truncate opacity-90 font-medium shrink-0">{data.explanation}</span>
+
+                                                    <span className="ml-3 mr-2 opacity-30 shrink-0">=</span>
+                                                </div>
+                                            )}
+
+                                            {/* Result with Tooltip */}
+                                            <div className={`relative flex items-center justify-end shrink-0 ${ResultColor}`}>
+                                                {Icon}
+                                                <span className="truncate">{data.formatted}</span>
+
+                                                {/* Formula Tooltip */}
+                                                {displayFormula && !displayFormula.match(/^[\d.]+$/) && (
+                                                    <div className="absolute bottom-full right-0 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg shadow-lg whitespace-nowrap opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity duration-200 z-50">
+                                                        <span className="font-mono">{displayFormula}</span>
+                                                        <div className="absolute top-full right-4 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-900" />
+                                                    </div>
                                                 )}
-
-                                                {/* Formula */}
-                                                {data.expression && !data.expression.match(/^[\d.]+$/) && (
-                                                    <>
-                                                        {data.explanation && <span className="mx-2 opacity-20 shrink-0">|</span>}
-                                                        <span className="font-mono opacity-70 truncate max-w-[300px] xl:max-w-none">{friendlyExpression}</span>
-                                                    </>
-                                                )}
-
-                                                <span className="ml-3 opacity-20 shrink-0 select-none">=</span>
-                                            </motion.div>
-                                        )}
-                                    </AnimatePresence>
-
-                                    {/* Calculated Result */}
-                                    <motion.div
-                                        initial={{ opacity: 0, scale: 0.9 }}
-                                        animate={{ opacity: 1, scale: 1 }}
-                                        className={`flex items-center justify-end ${ResultColor} ${data.type === 'total' ? 'scale-110 origin-right' : ''} shrink-0`}
-                                    >
-                                        {Icon}
-                                        <span className="truncate tabular-nums tracking-normal">{data.formatted}</span>
-                                    </motion.div>
-
+                                            </div>
+                                        </>
+                                    )}
                                 </div>
                             );
                         })}
                     </div>
                 </div>
-
             </div>
-
-            {/* --- FOOTER --- */}
-            <div className={`px-6 py-2 text-[10px] border-t flex justify-between uppercase tracking-widest font-semibold ${isDarkMode ? 'bg-[#1e1e1e] border-zinc-800 text-zinc-600' : 'bg-white border-zinc-50 text-zinc-300'}`}>
-                <div className="flex items-center gap-2">
-                    <div className={`w-1.5 h-1.5 rounded-full ${serverStatus === 'connected' ? 'bg-green-500' : serverStatus === 'error' ? 'bg-red-500' : 'bg-yellow-500'}`} />
-                    <span>Llama Engine Active</span>
-                </div>
-
-            </div>
-
         </div>
     );
 };
