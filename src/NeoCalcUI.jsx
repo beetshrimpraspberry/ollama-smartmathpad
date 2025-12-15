@@ -1,10 +1,14 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
-    Plus, Search, Command, X,
-    LayoutGrid, Settings, FileText,
-    ChevronRight, Save, MoreVertical,
-    Sidebar, PanelRight, Cloud, Zap
+    Plus, Search, Command, X, FolderOpen, Download,
+    LayoutGrid, Settings, FileText, FilePlus, Undo, Redo,
+    ChevronRight, Save, MoreVertical, Terminal, Eye, EyeOff,
+    Sidebar, PanelRight, Cloud, Zap, Copy, Scissors
 } from 'lucide-react';
+import { createFile, saveFile, getFile, getAllFiles, renameFile, deleteFile, addLog } from './lib/db';
+import SplashScreen from './components/SplashScreen';
+import InstallPrompt from './components/InstallPrompt';
+import DebugPanel from './components/DebugPanel';
 
 // --- THEME ---
 const BG_STYLE = "bg-zinc-950 text-zinc-400 font-mono";
@@ -60,44 +64,172 @@ const SAFE_FUNCS = {
 };
 
 const NeoCalcUI = () => {
+    // --- STATE ---
+    const [isLoading, setIsLoading] = useState(true); // Splash screen
     const [view, setView] = useState('editor');
-    const [tabs, setTabs] = useState([
-        { id: 1, title: 'Q4_Marketing_Budget.calc', active: true }
-    ]);
+    const [tabs, setTabs] = useState([]);
+    const [files, setFiles] = useState([]);
+    const [currentFileId, setCurrentFileId] = useState(null);
     const [showSidebar, setShowSidebar] = useState(true);
-    const [text, setText] = useState(MOCK_FILES[0].content);
+    const [showDebugPanel, setShowDebugPanel] = useState(false);
+    const [text, setText] = useState('');
     const [computedResults, setComputedResults] = useState({});
     const [aiLogic, setAiLogic] = useState({});
     const [loading, setLoading] = useState(false);
     const [serverStatus, setServerStatus] = useState('unknown');
+    const [lastInput, setLastInput] = useState(null);
+    const [lastOutput, setLastOutput] = useState(null);
+    const [activeMenu, setActiveMenu] = useState(null);
+    const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
 
     const textareaRef = useRef(null);
+    const saveTimeoutRef = useRef(null);
     const ROW_HEIGHT = 32;
 
+    // --- INITIALIZE ---
+    useEffect(() => {
+        const init = async () => {
+            // Load files from IndexedDB
+            let dbFiles = await getAllFiles();
+
+            // If no files exist, create sample files
+            if (dbFiles.length === 0) {
+                for (const mock of MOCK_FILES) {
+                    await createFile(mock.title, mock.content);
+                }
+                dbFiles = await getAllFiles();
+            }
+
+            setFiles(dbFiles);
+
+            // Open first file
+            if (dbFiles.length > 0) {
+                const firstFile = dbFiles[0];
+                setCurrentFileId(firstFile.id);
+                setText(firstFile.content);
+                setAiLogic(firstFile.aiLogic || {});
+                setTabs([{ id: firstFile.id, title: firstFile.title, active: true }]);
+            }
+
+            // Hide splash after loading
+            setTimeout(() => setIsLoading(false), 800);
+        };
+
+        init();
+    }, []);
+
+    // --- AUTO-SAVE ---
+    useEffect(() => {
+        if (!currentFileId || !hasUnsavedChanges) return;
+
+        if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+
+        saveTimeoutRef.current = setTimeout(async () => {
+            await saveFile(currentFileId, text, aiLogic);
+            setHasUnsavedChanges(false);
+            setFiles(await getAllFiles());
+        }, 1000);
+
+        return () => clearTimeout(saveTimeoutRef.current);
+    }, [text, currentFileId, hasUnsavedChanges, aiLogic]);
+
+    // Track text changes
+    const handleTextChange = (e) => {
+        setText(e.target.value);
+        setHasUnsavedChanges(true);
+    };
+
     // --- FILE HANDLING ---
-    const openFile = (file) => {
+    const openFile = async (file) => {
         if (!tabs.find(t => t.id === file.id)) {
             setTabs([...tabs.map(t => ({ ...t, active: false })), { id: file.id, title: file.title, active: true }]);
         } else {
             setTabs(tabs.map(t => ({ ...t, active: t.id === file.id })));
         }
+        setCurrentFileId(file.id);
         setText(file.content);
+        setAiLogic(file.aiLogic || {});
         setView('editor');
+        setActiveMenu(null);
     };
 
-    const closeTab = (e, id) => {
+    const closeTab = async (e, id) => {
         e.stopPropagation();
         const newTabs = tabs.filter(t => t.id !== id);
         if (newTabs.length === 0) {
             setView('home');
             setText('');
+            setCurrentFileId(null);
         } else {
             newTabs[newTabs.length - 1].active = true;
-            const activeFile = MOCK_FILES.find(f => f.id === newTabs[newTabs.length - 1].id);
-            if (activeFile) setText(activeFile.content);
+            const activeFile = files.find(f => f.id === newTabs[newTabs.length - 1].id);
+            if (activeFile) {
+                setCurrentFileId(activeFile.id);
+                setText(activeFile.content);
+                setAiLogic(activeFile.aiLogic || {});
+            }
         }
         setTabs(newTabs);
     };
+
+    const handleNewFile = async () => {
+        const title = `Untitled_${Date.now()}.calc`;
+        const id = await createFile(title, '# New Document\n\n');
+        const newFile = await getFile(id);
+        setFiles(await getAllFiles());
+        await openFile(newFile);
+        setActiveMenu(null);
+    };
+
+    const handleSaveFile = async () => {
+        if (currentFileId) {
+            await saveFile(currentFileId, text, aiLogic);
+            setHasUnsavedChanges(false);
+            setFiles(await getAllFiles());
+            await addLog('info', 'File saved', { id: currentFileId });
+        }
+        setActiveMenu(null);
+    };
+
+    const handleExportFile = () => {
+        const activeTab = tabs.find(t => t.active);
+        const filename = activeTab?.title || 'export.calc';
+        const blob = new Blob([text], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+        setActiveMenu(null);
+    };
+
+    const handleDeleteFile = async (id) => {
+        await deleteFile(id);
+        setFiles(await getAllFiles());
+        // Close tab if open
+        const tabIdx = tabs.findIndex(t => t.id === id);
+        if (tabIdx !== -1) {
+            closeTab({ stopPropagation: () => { } }, id);
+        }
+    };
+
+    // Keyboard shortcuts
+    useEffect(() => {
+        const handler = (e) => {
+            if (e.metaKey || e.ctrlKey) {
+                if (e.key === 's') {
+                    e.preventDefault();
+                    handleSaveFile();
+                } else if (e.key === 'n') {
+                    e.preventDefault();
+                    handleNewFile();
+                }
+            }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+    }, [currentFileId, text, aiLogic]);
 
     // --- LOCAL EVALUATION ENGINE ---
     const evaluateDocument = (inputText) => {
@@ -241,7 +373,11 @@ IMPORTANT:
 - For example: "Fees = (Social Ads + Influencer Spend) * Platform Fee Rate" should have formula: "(Social Ads + Influencer Spend) * Platform Fee Rate"
 - Return ONLY valid JSON. Use variable names when available.`;
 
+        const llmInput = { lines: lineMap, variables };
+        setLastInput(llmInput);
+
         try {
+            const startTime = Date.now();
             const response = await fetch(LOCAL_API_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -249,7 +385,7 @@ IMPORTANT:
                     model: "gpt-3.5-turbo",
                     messages: [
                         { role: "system", content: systemPrompt },
-                        { role: "user", content: JSON.stringify({ lines: lineMap, variables }) }
+                        { role: "user", content: JSON.stringify(llmInput) }
                     ],
                     temperature: 0.1,
                 }),
@@ -258,22 +394,27 @@ IMPORTANT:
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
             const data = await response.json();
-            console.log('LLM Raw Response:', data);
+            const elapsed = Date.now() - startTime;
             const textResult = data.choices?.[0]?.message?.content;
-            console.log('LLM Text Result:', textResult);
+
+            setLastOutput({ raw: data, parsed: null, elapsed });
+
             if (textResult) {
                 setServerStatus('connected');
                 try {
                     const parsed = JSON.parse(textResult);
-                    console.log('Parsed AI Logic:', parsed);
                     setAiLogic(parsed);
+                    setLastOutput({ raw: data, parsed, elapsed });
+                    setHasUnsavedChanges(true); // Mark as changed to save AI logic
+                    await addLog('llm', `Response in ${elapsed}ms`, { input: llmInput, output: parsed });
                 } catch (e) {
-                    console.error('JSON parse error:', e);
+                    await addLog('error', 'JSON parse error', { error: e.message, raw: textResult });
                 }
             }
         } catch (err) {
-            console.error('LLM Error:', err);
             setServerStatus('error');
+            setLastOutput({ error: err.message });
+            await addLog('error', 'LLM request failed', { error: err.message });
         } finally {
             setLoading(false);
         }
@@ -436,33 +577,117 @@ IMPORTANT:
 
     return (
         <div className={`h-screen w-full ${BG_STYLE} flex flex-col overflow-hidden`}>
+            {/* Splash Screen */}
+            <SplashScreen isLoading={isLoading} />
+
+            {/* Install Prompt */}
+            <InstallPrompt />
+
+            {/* Debug Panel */}
+            <DebugPanel
+                isOpen={showDebugPanel}
+                onClose={() => setShowDebugPanel(false)}
+                serverStatus={serverStatus}
+                lastInput={lastInput}
+                lastOutput={lastOutput}
+            />
 
             {/* --- STATUS BAR / MENU --- */}
-            <header className={`h-10 flex-none flex items-center px-3 gap-4 border-b ${BORDER_COLOR} bg-zinc-950 text-xs`}>
+            <header className={`h-10 flex-none flex items-center px-3 gap-4 border-b ${BORDER_COLOR} bg-zinc-950 text-xs relative z-50`}>
                 <div className="flex items-center gap-2 text-zinc-100 font-bold tracking-tight">
                     <div className="w-4 h-4 bg-blue-600 flex items-center justify-center rounded-sm">
                         <span className="text-[10px] text-white font-mono">Σ</span>
                     </div>
                     <span>NeoCalc</span>
+                    {hasUnsavedChanges && <span className="text-yellow-500">●</span>}
                 </div>
 
                 <div className="h-4 w-[1px] bg-zinc-800 mx-2"></div>
 
-                <div className="flex items-center gap-4">
-                    <button className="hover:text-zinc-100 transition-colors">File</button>
-                    <button className="hover:text-zinc-100 transition-colors">Edit</button>
-                    <button className="hover:text-zinc-100 transition-colors">View</button>
-                    <a href="/" className="hover:text-zinc-100 transition-colors">Classic UI</a>
+                {/* File Menu */}
+                <div className="relative">
+                    <button
+                        onClick={() => setActiveMenu(activeMenu === 'file' ? null : 'file')}
+                        className={`px-2 py-1 rounded hover:bg-zinc-800 transition-colors ${activeMenu === 'file' ? 'bg-zinc-800 text-zinc-100' : ''}`}
+                    >
+                        File
+                    </button>
+                    {activeMenu === 'file' && (
+                        <div className="absolute top-full left-0 mt-1 w-48 bg-zinc-900 border border-zinc-800 rounded-lg shadow-xl py-1">
+                            <button onClick={handleNewFile} className="w-full px-3 py-1.5 flex items-center gap-2 hover:bg-zinc-800 text-left">
+                                <FilePlus className="w-3.5 h-3.5" /> New File <span className="ml-auto text-zinc-600">⌘N</span>
+                            </button>
+                            <button onClick={handleSaveFile} className="w-full px-3 py-1.5 flex items-center gap-2 hover:bg-zinc-800 text-left">
+                                <Save className="w-3.5 h-3.5" /> Save <span className="ml-auto text-zinc-600">⌘S</span>
+                            </button>
+                            <button onClick={handleExportFile} className="w-full px-3 py-1.5 flex items-center gap-2 hover:bg-zinc-800 text-left">
+                                <Download className="w-3.5 h-3.5" /> Export
+                            </button>
+                            <div className="border-t border-zinc-800 my-1"></div>
+                            <a href="/" className="w-full px-3 py-1.5 flex items-center gap-2 hover:bg-zinc-800 text-left block">
+                                Classic UI
+                            </a>
+                        </div>
+                    )}
                 </div>
 
-                <div className="flex-1"></div>
+                {/* Edit Menu */}
+                <div className="relative">
+                    <button
+                        onClick={() => setActiveMenu(activeMenu === 'edit' ? null : 'edit')}
+                        className={`px-2 py-1 rounded hover:bg-zinc-800 transition-colors ${activeMenu === 'edit' ? 'bg-zinc-800 text-zinc-100' : ''}`}
+                    >
+                        Edit
+                    </button>
+                    {activeMenu === 'edit' && (
+                        <div className="absolute top-full left-0 mt-1 w-44 bg-zinc-900 border border-zinc-800 rounded-lg shadow-xl py-1">
+                            <button onClick={() => { document.execCommand('undo'); setActiveMenu(null); }} className="w-full px-3 py-1.5 flex items-center gap-2 hover:bg-zinc-800 text-left">
+                                <Undo className="w-3.5 h-3.5" /> Undo <span className="ml-auto text-zinc-600">⌘Z</span>
+                            </button>
+                            <button onClick={() => { document.execCommand('redo'); setActiveMenu(null); }} className="w-full px-3 py-1.5 flex items-center gap-2 hover:bg-zinc-800 text-left">
+                                <Redo className="w-3.5 h-3.5" /> Redo <span className="ml-auto text-zinc-600">⇧⌘Z</span>
+                            </button>
+                            <div className="border-t border-zinc-800 my-1"></div>
+                            <button onClick={() => { document.execCommand('cut'); setActiveMenu(null); }} className="w-full px-3 py-1.5 flex items-center gap-2 hover:bg-zinc-800 text-left">
+                                <Scissors className="w-3.5 h-3.5" /> Cut <span className="ml-auto text-zinc-600">⌘X</span>
+                            </button>
+                            <button onClick={() => { document.execCommand('copy'); setActiveMenu(null); }} className="w-full px-3 py-1.5 flex items-center gap-2 hover:bg-zinc-800 text-left">
+                                <Copy className="w-3.5 h-3.5" /> Copy <span className="ml-auto text-zinc-600">⌘C</span>
+                            </button>
+                        </div>
+                    )}
+                </div>
+
+                {/* View Menu */}
+                <div className="relative">
+                    <button
+                        onClick={() => setActiveMenu(activeMenu === 'view' ? null : 'view')}
+                        className={`px-2 py-1 rounded hover:bg-zinc-800 transition-colors ${activeMenu === 'view' ? 'bg-zinc-800 text-zinc-100' : ''}`}
+                    >
+                        View
+                    </button>
+                    {activeMenu === 'view' && (
+                        <div className="absolute top-full left-0 mt-1 w-48 bg-zinc-900 border border-zinc-800 rounded-lg shadow-xl py-1">
+                            <button onClick={() => { setShowSidebar(!showSidebar); setActiveMenu(null); }} className="w-full px-3 py-1.5 flex items-center gap-2 hover:bg-zinc-800 text-left">
+                                {showSidebar ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                                {showSidebar ? 'Hide Sidebar' : 'Show Sidebar'}
+                            </button>
+                            <button onClick={() => { setShowDebugPanel(!showDebugPanel); setActiveMenu(null); }} className="w-full px-3 py-1.5 flex items-center gap-2 hover:bg-zinc-800 text-left">
+                                <Terminal className="w-3.5 h-3.5" />
+                                {showDebugPanel ? 'Hide Debug Panel' : 'Show Debug Panel'}
+                            </button>
+                        </div>
+                    )}
+                </div>
+
+                <div className="flex-1" onClick={() => setActiveMenu(null)}></div>
 
                 <div className="flex items-center gap-3 text-zinc-500">
                     <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-zinc-900 border border-zinc-800">
                         <Command className="w-3 h-3" />
                         <span>P</span>
                     </div>
-                    <span>v2.0.1</span>
+                    <span>v2.1.0</span>
                 </div>
             </header>
 
@@ -474,19 +699,23 @@ IMPORTANT:
                     <aside className={`w-64 flex-none border-r ${BORDER_COLOR} bg-zinc-950 flex flex-col`}>
                         <div className="p-3 text-xs font-bold uppercase tracking-wider text-zinc-500 flex justify-between items-center">
                             <span>Explorer</span>
-                            <MoreVertical className="w-3 h-3 cursor-pointer hover:text-zinc-300" />
+                            <button onClick={handleNewFile} className="hover:text-blue-500 transition-colors">
+                                <Plus className="w-4 h-4" />
+                            </button>
                         </div>
 
                         <div className="flex-1 overflow-y-auto py-2">
-                            {MOCK_FILES.map(file => (
+                            {files.map(file => (
                                 <div
                                     key={file.id}
                                     onClick={() => openFile(file)}
-                                    className="px-3 py-1.5 flex items-center gap-2 hover:bg-zinc-900 cursor-pointer text-sm group"
+                                    className={`px-3 py-1.5 flex items-center gap-2 cursor-pointer text-sm group ${currentFileId === file.id ? 'bg-zinc-900 text-zinc-100' : 'hover:bg-zinc-900'}`}
                                 >
-                                    <FileText className="w-3.5 h-3.5 text-zinc-600 group-hover:text-blue-500" />
+                                    <FileText className={`w-3.5 h-3.5 ${currentFileId === file.id ? 'text-blue-500' : 'text-zinc-600 group-hover:text-blue-500'}`} />
                                     <span className="truncate flex-1 group-hover:text-zinc-200 transition-colors">{file.title}</span>
-                                    <span className="text-[10px] text-zinc-700">{file.size}</span>
+                                    <span className="text-[10px] text-zinc-700">
+                                        {new Date(file.updatedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                                    </span>
                                 </div>
                             ))}
                         </div>
@@ -534,7 +763,7 @@ IMPORTANT:
                                 <textarea
                                     ref={textareaRef}
                                     value={text}
-                                    onChange={(e) => setText(e.target.value)}
+                                    onChange={handleTextChange}
                                     className="w-full h-full bg-transparent border-none outline-none resize-none pl-16 pr-4 py-4 font-mono text-sm leading-[32px] text-zinc-300 caret-blue-500 placeholder-zinc-700"
                                     spellCheck="false"
                                     autoFocus
@@ -548,11 +777,24 @@ IMPORTANT:
                                         const data = computedResults[idx];
                                         const trimmed = line.trim();
 
-                                        // Comment/Header line
-                                        if (trimmed.startsWith('#') || trimmed.startsWith('//')) {
+                                        // Markdown Header line
+                                        if (trimmed.startsWith('#')) {
+                                            const level = (trimmed.match(/^#+/) || [''])[0].length;
+                                            const headerText = trimmed.replace(/^#+\s*/, '');
                                             return (
-                                                <div key={idx} className="h-[32px] text-zinc-600 italic opacity-50 select-none truncate">
-                                                    {trimmed}
+                                                <div key={idx} className={`h-[32px] flex items-center justify-end text-zinc-500 select-none truncate ${level === 1 ? 'font-bold text-zinc-400' :
+                                                    level === 2 ? 'font-semibold text-zinc-500' : 'text-zinc-600'
+                                                    }`}>
+                                                    {headerText}
+                                                </div>
+                                            );
+                                        }
+
+                                        // Comment line
+                                        if (trimmed.startsWith('//')) {
+                                            return (
+                                                <div key={idx} className="h-[32px] text-zinc-700 italic opacity-50 select-none truncate">
+                                                    {trimmed.slice(2).trim()}
                                                 </div>
                                             );
                                         }
@@ -646,11 +888,17 @@ IMPORTANT:
 
                         <div className="flex-1"></div>
 
-                        <div className="flex items-center gap-2">
+                        <div
+                            className="flex items-center gap-2 cursor-pointer hover:text-zinc-200"
+                            onClick={() => setShowDebugPanel(!showDebugPanel)}
+                        >
                             <span className={`w-2 h-2 rounded-full ${serverStatus === 'connected' ? 'bg-green-500' : serverStatus === 'error' ? 'bg-red-500' : 'bg-yellow-500'}`}></span>
                             <span>Local Engine</span>
                         </div>
-                        <div className="flex items-center gap-2">
+                        <div
+                            className="flex items-center gap-2 cursor-pointer hover:text-zinc-200"
+                            onClick={() => setShowDebugPanel(!showDebugPanel)}
+                        >
                             <Cloud className="w-3 h-3" />
                             <span>{loading ? 'Processing...' : 'AI Ready'}</span>
                         </div>
