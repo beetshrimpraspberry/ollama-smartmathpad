@@ -457,70 +457,39 @@ IMPORTANT:
                 return;
             }
 
-            // Case B: Try AI logic (same as App.jsx)
+            // Case B: AI Logic (copied from App.jsx)
             const aiItem = aiLogic[idx];
-            if (aiItem) {
-                console.log(`AI Item for line ${idx}:`, aiItem);
+            if (aiItem && aiItem.formula) {
                 try {
-                    // Handle header/note types first
-                    if (aiItem.type === 'header' || aiItem.type === 'note') {
-                        finalResults[idx] = {
-                            value: null,
-                            formatted: '',
-                            type: aiItem.type,
-                            explanation: aiItem.explanation,
-                            formula: '',
-                            source: 'ai'
-                        };
-                        return;
-                    }
-
-                    // Get parsable formula - could be in formula or value field
-                    let parsable = aiItem.formula || '';
-                    const aiValue = aiItem.value;
-
-                    // If value is a string with operators, use it as formula
-                    if (typeof aiValue === 'string' && /[+\-*/()]/.test(aiValue)) {
-                        parsable = aiValue;
-                    } else if (typeof aiValue === 'number') {
-                        // Direct numeric value from AI
-                        finalResults[idx] = {
-                            value: aiValue,
-                            type: aiItem.type || 'variable',
-                            format: aiItem.format || 'number',
-                            expression: aiItem.formula,
-                            explanation: aiItem.explanation,
-                            source: 'ai'
-                        };
-                        currentValues[idx] = aiValue;
-                        if (aiItem.formula) variableValues[aiItem.formula] = aiValue;
-                        return;
-                    }
-
-                    if (!parsable) return;
+                    let parsable = aiItem.formula;
 
                     // If formula contains "=", take only the right side (the expression)
+                    // e.g., "Total Fixed Costs = Venue Rental + Stage & Sound" -> "Venue Rental + Stage & Sound"
                     if (parsable.includes('=')) {
                         const eqIdx = parsable.indexOf('=');
                         parsable = parsable.slice(eqIdx + 1).trim();
                     }
 
-                    // Handle variable type - show explanation only
-                    if (parsable.toLowerCase() === 'variable' || parsable.toLowerCase() === 'header' || parsable.toLowerCase() === 'note') {
+                    // Handle header/note types - show explanation only, no calculation
+                    if (['header', 'note', 'variable'].includes(parsable.toLowerCase()) || aiItem.type === 'header' || aiItem.type === 'note') {
                         if (aiItem.explanation) {
                             finalResults[idx] = {
                                 value: null,
+                                formatted: '',
                                 type: aiItem.type,
                                 explanation: aiItem.explanation,
+                                formula: '',
                                 source: 'ai'
                             };
                         }
                         return;
                     }
 
-                    // Replace variable names with their values (sort by length to avoid partial matches)
+                    // First, replace variable names with their values
+                    // Sort by length descending to avoid partial matches (e.g., "Rent" vs "Rent Total")
                     const sortedVarNames = Object.keys(variableValues).sort((a, b) => b.length - a.length);
                     for (const varName of sortedVarNames) {
+                        // Escape special regex chars and create pattern that handles spaces
                         const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                         const regex = new RegExp(escaped, 'gi');
                         parsable = parsable.replace(regex, variableValues[varName]);
@@ -528,6 +497,7 @@ IMPORTANT:
 
                     // Handle L{prev} - replace with previous line's value
                     parsable = parsable.replace(/L\{prev\}/gi, () => {
+                        // Find the closest previous line with a value
                         for (let i = idx - 1; i >= 0; i--) {
                             if (finalResults[i]?.value !== undefined) return finalResults[i].value;
                             if (currentValues[i] !== undefined) return currentValues[i];
@@ -547,34 +517,39 @@ IMPORTANT:
                         return v;
                     });
 
-                    // Handle sum(tag)
-                    parsable = parsable.replace(/sum\((\w+)\)/gi, (_, tag) => 0);
+                    // Handle sum(tag) - sum all values with that tag
+                    parsable = parsable.replace(/sum\((\w+)\)/gi, (_, tag) => {
+                        // For now, just use 0 - the local engine handles sum() better
+                        return 0;
+                    });
 
-                    // Handle math functions
+                    // Handle math functions the AI might use
                     parsable = parsable.replace(/sqrt\(([^)]+)\)/gi, (_, arg) => `Math.sqrt(${arg})`);
                     parsable = parsable.replace(/round\(([^,]+),\s*(\d+)\)/gi, (_, num, dec) => `(Math.round(${num} * Math.pow(10, ${dec})) / Math.pow(10, ${dec}))`);
                     parsable = parsable.replace(/max\(([^)]+)\)/gi, (_, args) => `Math.max(${args})`);
                     parsable = parsable.replace(/min\(([^)]+)\)/gi, (_, args) => `Math.min(${args})`);
 
-                    // Skip if formula is empty
+                    // Skip if formula is empty or non-numeric
                     if (!parsable || parsable === '' || parsable === '0') {
                         return;
                     }
 
+                    // eslint-disable-next-line no-new-func
                     const val = new Function(`return (${parsable})`)();
 
                     if (Number.isFinite(val)) {
                         finalResults[idx] = {
                             value: val,
-                            type: aiItem.type || 'calc',
-                            format: aiItem.format || 'number',
-                            expression: aiItem.formula,
+                            formatted: formatValue(val, aiItem.format),
+                            type: aiItem.type,
                             explanation: aiItem.explanation,
+                            formula: aiItem.formula,
                             source: 'ai'
                         };
                         currentValues[idx] = val;
 
-                        // Add computed result to variableValues for later formulas
+                        // Also add computed result to variableValues so later formulas can use it
+                        // Extract variable name from left side of "=" in original formula
                         const originalFormula = aiItem.formula;
                         if (originalFormula.includes('=')) {
                             const computedVarName = originalFormula.slice(0, originalFormula.indexOf('=')).trim();
@@ -583,9 +558,7 @@ IMPORTANT:
                             }
                         }
                     }
-                } catch (e) {
-                    console.log('Parse error for line', idx, ':', e.message);
-                }
+                } catch (e) { /* ignore */ }
             }
         });
 

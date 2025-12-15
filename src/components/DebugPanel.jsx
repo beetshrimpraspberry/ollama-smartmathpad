@@ -24,22 +24,39 @@ const DebugPanel = ({ isOpen, onClose, serverStatus, lastInput, lastOutput }) =>
     };
 
     const handleCopy = async (data) => {
+        console.log('Copy clicked with data:', data);
         const text = JSON.stringify(data, null, 2);
-        try {
-            await navigator.clipboard.writeText(text);
-            alert('Copied to clipboard!');
-        } catch (err) {
-            // Fallback for non-secure contexts
-            const textArea = document.createElement('textarea');
-            textArea.value = text;
-            textArea.style.position = 'fixed';
-            textArea.style.left = '-999999px';
-            document.body.appendChild(textArea);
-            textArea.select();
-            document.execCommand('copy');
-            document.body.removeChild(textArea);
-            alert('Copied to clipboard!');
+        console.log('Text to copy:', text);
+
+        // Try modern clipboard API first
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            try {
+                await navigator.clipboard.writeText(text);
+                console.log('Copied via clipboard API');
+                return;
+            } catch (err) {
+                console.log('Clipboard API failed:', err);
+            }
         }
+
+        // Fallback: create textarea and copy
+        const textArea = document.createElement('textarea');
+        textArea.value = text;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-999999px';
+        textArea.style.top = '-999999px';
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+
+        try {
+            const result = document.execCommand('copy');
+            console.log('execCommand result:', result);
+        } catch (err) {
+            console.error('execCommand failed:', err);
+        }
+
+        document.body.removeChild(textArea);
     };
 
     const toggleExpand = (id) => {
