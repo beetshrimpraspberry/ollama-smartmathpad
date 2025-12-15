@@ -23,8 +23,23 @@ const DebugPanel = ({ isOpen, onClose, serverStatus, lastInput, lastOutput }) =>
         setLogs([]);
     };
 
-    const handleCopy = (data) => {
-        navigator.clipboard.writeText(JSON.stringify(data, null, 2));
+    const handleCopy = async (data) => {
+        const text = JSON.stringify(data, null, 2);
+        try {
+            await navigator.clipboard.writeText(text);
+            alert('Copied to clipboard!');
+        } catch (err) {
+            // Fallback for non-secure contexts
+            const textArea = document.createElement('textarea');
+            textArea.value = text;
+            textArea.style.position = 'fixed';
+            textArea.style.left = '-999999px';
+            document.body.appendChild(textArea);
+            textArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textArea);
+            alert('Copied to clipboard!');
+        }
     };
 
     const toggleExpand = (id) => {
