@@ -9,7 +9,7 @@
 export const LOCAL_API_URL = 'http://localhost:8080/v1/chat/completions';
 
 // Background style used across the app
-export const BG_STYLE = 'bg-zinc-950 text-zinc-100';
+
 
 /**
  * Safe math functions available in user expressions.
@@ -17,22 +17,22 @@ export const BG_STYLE = 'bg-zinc-950 text-zinc-100';
  * mathematical functions like sqrt(16) or abs(-5).
  */
 export const SAFE_FUNCS = {
-    sqrt: Math.sqrt,
-    abs: Math.abs,
-    round: Math.round,
-    floor: Math.floor,
-    ceil: Math.ceil,
-    min: Math.min,
-    max: Math.max,
-    pow: Math.pow,
-    log: Math.log,
-    log10: Math.log10,
-    exp: Math.exp,
-    sin: Math.sin,
-    cos: Math.cos,
-    tan: Math.tan,
-    PI: Math.PI,
-    E: Math.E
+  sqrt: Math.sqrt,
+  abs: Math.abs,
+  round: Math.round,
+  floor: Math.floor,
+  ceil: Math.ceil,
+  min: Math.min,
+  max: Math.max,
+  pow: Math.pow,
+  log: Math.log,
+  log10: Math.log10,
+  exp: Math.exp,
+  sin: Math.sin,
+  cos: Math.cos,
+  tan: Math.tan,
+  PI: Math.PI,
+  E: Math.E
 };
 
 /**

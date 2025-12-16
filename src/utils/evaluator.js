@@ -11,7 +11,7 @@
  * The local engine runs first and its results take priority over AI results.
  */
 
-import { SAFE_FUNCS } from './constants';
+import { SAFE_FUNCS } from './constants.js';
 
 // ============================================
 // HELPER FUNCTIONS
@@ -27,7 +27,7 @@ export const stripInlineComment = (s) => s.replace(/\/\/.*$/, '').trim();
  * Removes hashtag-style tags from a line.
  * Example: "Groceries: 150 #food" → "Groceries: 150"
  */
-export const removeTags = (line) => line.replace(/#([A-Za-z][\w-]*)/g, '').trim();
+export const removeTags = (line) => line.replace(/#([A-Za-z0-9][\w-]*)/g, '').trim();
 
 /**
  * Extracts a tag from a line. Tags can be:
@@ -36,10 +36,14 @@ export const removeTags = (line) => line.replace(/#([A-Za-z][\w-]*)/g, '').trim(
  * Returns the tag name in lowercase, or null if no tag found.
  */
 export const extractTag = (line) => {
-    const m1 = line.match(/\btag\s*:\s*([A-Za-z][\w-]*)/i);
-    if (m1) return m1[1].toLowerCase();
-    const m2 = line.match(/#([A-Za-z][\w-]*)/);
+    // Explicit tag: "tag: my tag" (allows spaces)
+    const m1 = line.match(/\btag\s*:\s*([A-Za-z0-9][\w\s-]*)/i);
+    if (m1) return m1[1].toLowerCase().trim();
+
+    // Hashtag: "#myTag" (no spaces, can start with number)
+    const m2 = line.match(/#([A-Za-z0-9][\w-]*)/);
     if (m2) return m2[1].toLowerCase();
+
     return null;
 };
 
@@ -52,11 +56,36 @@ export const normalizeVarName = (raw) =>
     raw.trim().replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || null;
 
 /**
- * Removes natural language "glue" words that don't affect math.
+ * Removes natural language "glue" words and common unit words that don't affect math.
+ * Example: "6 hours * rate" → "6  * rate"
  * Example: "20% of total" → "20%  total"
+ * 
+ * Note: We don't strip common words like 'rate', 'total' as they may be part of variable names.
  */
+export const normalizeUnits = (expr) => {
+    let s = expr;
+    // 1. Remove rate indicators: /hr, /hour, /day, /week, /month, /year, /person, /unit
+    // Replace with empty string (stripping the rate unit part)
+    s = s.replace(/\/\s*(?:hr|hour|day|week|month|year|person|unit|item)s?\b/gi, '');
+
+    // 2. Remove trailing unit words after numbers: "8 hours" -> "8"
+    // Be careful not to match variables, only number + unit pattern
+    s = s.replace(/(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|days?|weeks?|months?|years?|mins?|secs?)\b/gi, '$1');
+    return s;
+};
+
 export const tokenizeNaturalGlue = (expr) => {
-    const glue = ['per', 'of', 'on', 'at', 'for', 'a', 'an', 'the', 'is', 'equals', 'equal'];
+    const glue = [
+        // Glue words
+        'per', 'of', 'on', 'at', 'for', 'a', 'an', 'the', 'is', 'equals', 'equal',
+        // Time units (these appear between a number and operator, not as variable names)
+        'hours', 'hour', 'hrs', 'hr', 'days', 'day', 'weeks', 'week', 'months', 'month', 'years', 'year',
+        'minutes', 'minute', 'mins', 'min', 'seconds', 'second', 'secs', 'sec',
+        // Count units  
+        'items', 'item', 'units', 'unit', 'pieces', 'piece', 'pcs', 'pc',
+        // Other modifiers
+        'flat', 'fee', 'each'
+    ];
     const re = new RegExp('\\b(' + glue.join('|') + ')\\b', 'gi');
     return expr.replace(re, ' ');
 };
@@ -71,6 +100,7 @@ export const tokenizeNaturalGlue = (expr) => {
  */
 export const preprocessExpression = (expr) => {
     let s = expr.trim();
+    s = normalizeUnits(s);
     s = s.replace(/×/g, '*').replace(/÷/g, '/').replace(/−/g, '-');
     s = s.replace(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)/g, (_, num) => String(num).replace(/,/g, ''));
     s = s.replace(/([0-9]+(?:\.[0-9]+)?)\s*%/g, '($1/100)');
@@ -80,13 +110,61 @@ export const preprocessExpression = (expr) => {
 };
 
 /**
+ * Substitutes variable names in an expression with their numeric values.
+ * This handles variable names with spaces (e.g., "Room Length").
+ * 
+ * Variables are sorted by length (longest first) to avoid partial matches.
+ * Example: "Room Length * Room Width" with scope { "Room Length": 18, "Room Width": 14 }
+ *          → "18 * 14"
+ * 
+ * @param {string} expr - The expression to process
+ * @param {Object} scope - Object mapping variable names to numeric values
+ * @returns {string} - Expression with variables replaced by their values
+ */
+export const substituteVariables = (expr, scope) => {
+    if (!scope || Object.keys(scope).length === 0) return expr;
+
+    let result = expr;
+
+    // Sort variable names by length (longest first) to avoid partial matches
+    // e.g., "Total Area" should be matched before "Total"
+    const sortedNames = Object.keys(scope).sort((a, b) => b.length - a.length);
+
+    for (const varName of sortedNames) {
+        const value = scope[varName];
+        if (!Number.isFinite(value)) continue;
+
+        // Escape special regex characters in variable name
+        const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+        // Match whole variable name (not as part of another word)
+        // Allow for variable names with spaces
+        const pattern = new RegExp(`\\b${escaped}\\b`, 'gi');
+        result = result.replace(pattern, String(value));
+    }
+
+    return result;
+};
+
+
+/**
  * Checks if a string looks like it contains math to evaluate.
  * Returns true if it has numbers, operators, or math function calls.
  */
-export const looksLikeMath = (s) =>
-    /[0-9$%]/.test(s) ||
-    /[+\-*/^()]/.test(s) ||
-    /\b(sqrt|abs|min|max|round|floor|ceil|pow|log|exp)\s*\(/i.test(s);
+export const looksLikeMath = (s) => {
+    // Phase 1: Negative patterns (Reject these even if they have numbers)
+    if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(s)) return false; // Date: 12/25/2024
+    if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) return false;    // Time: 7:30
+    if (/^\d{3}[-.\s]?\d{3,4}[-.\s]?\d{4}$/.test(s)) return false; // Phone
+    if (/^https?:\/\//.test(s)) return false;             // URL
+    if (/\S+@\S+\.\S+/.test(s)) return false;             // Email
+    if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-/.test(s)) return false; // UUID-like
+
+    // Phase 2: Positive patterns
+    return /[0-9$%]/.test(s) ||
+        /[+\-*/^()]/.test(s) ||
+        /\b(sqrt|abs|min|max|round|floor|ceil|pow|log|exp)\s*\(/i.test(s);
+};
 
 /**
  * Builds an evaluator function with the given scope (variables).
@@ -141,7 +219,9 @@ export const classifyFormat = (rawLine) => /\$/.test(rawLine) ? 'currency' : 'nu
  */
 export const evaluateDocument = (fullText) => {
     const lines = fullText.split('\n');
-    const scope = Object.create(null);  // Variables defined so far
+    const mathScope = Object.create(null); // Valid JS identifiers only
+    const fullScope = Object.create(null); // All variables including friendly names
+    const variableLines = Object.create(null); // Map variable name -> line index
     const lineValues = [];               // Value for each line (for L{n} references)
     const lineTags = [];                 // Tag for each line (for sum:tag)
     const results = {};                  // Final results keyed by line index
@@ -158,7 +238,9 @@ export const evaluateDocument = (fullText) => {
         }
 
         // 2. Handle "sum: tagName" - sums all previous lines with that tag
-        const sumMatch = trimmed.match(/^sum\s*:\s*([A-Za-z][\w-]*)\s*$/i);
+        // Strip comment first
+        const textOnly = stripInlineComment(trimmed);
+        const sumMatch = textOnly.match(/^sum\s*:\s*([A-Za-z0-9][\w\s-]*)\s*$/i);
         if (sumMatch) {
             const tag = sumMatch[1].toLowerCase();
             let sum = 0;
@@ -179,6 +261,15 @@ export const evaluateDocument = (fullText) => {
             };
             lineValues.push(sum);
             lineTags.push(tag);
+
+            // Export to scope so it can be referenced (e.g., "Income - sum:food")
+            const rawLabel = `sum:${tag}`;
+            const formattedLabel = `sum: ${tag}`;
+            fullScope[rawLabel] = sum;
+            fullScope[formattedLabel] = sum;
+            fullScope[`sum(${tag})`] = sum;
+            // Note: sums are not typically valid JS identifiers, so don't add to mathScope unless valid
+
             continue;
         }
 
@@ -193,17 +284,27 @@ export const evaluateDocument = (fullText) => {
 
             if (varId && right.trim()) {
                 const exprRaw = removeTags(stripInlineComment(right));
-                const expr = preprocessExpression(exprRaw);
-                const evalFn = buildEvaluator(scope);
+                // First substitute any variable references (e.g., "Room Length" → 18)
+                const exprSubstituted = substituteVariables(exprRaw, fullScope);
+                const expr = preprocessExpression(exprSubstituted);
+                const evalFn = buildEvaluator(mathScope);
                 const val = evalFn(expr);
 
                 if (Number.isFinite(val)) {
-                    scope[varId] = val;
+                    // Internal evaluation needs safe names
+                    mathScope[varId] = val;
+
+                    // UI/AI can use friendly names
+                    const friendlyName = left.trim();
+                    fullScope[friendlyName] = val;
+                    fullScope[varId] = val;
+                    variableLines[friendlyName] = i;
+
                     results[i] = {
                         value: val,
                         type: 'variable',
                         format: classifyFormat(raw),
-                        explanation: `Set ${left.trim()}`,
+                        explanation: `Set ${friendlyName}`,
                         formula: exprRaw.trim(),
                         source: 'local'
                     };
@@ -226,9 +327,20 @@ export const evaluateDocument = (fullText) => {
             const expr = preprocessExpression(exprRaw);
 
             if (looksLikeMath(expr)) {
-                const evalFn = buildEvaluator(scope);
-                const val = evalFn(expr);
+                // Substitute variable references before evaluation
+                const exprSubstituted = substituteVariables(exprRaw, fullScope);
+                const exprFinal = preprocessExpression(exprSubstituted);
+                const evalFn = buildEvaluator(mathScope);
+                const val = evalFn(exprFinal);
                 if (Number.isFinite(val)) {
+                    const friendlyName = left.trim();
+                    const varId = normalizeVarName(friendlyName);
+
+                    if (varId) mathScope[varId] = val;
+                    fullScope[friendlyName] = val;
+                    if (varId) fullScope[varId] = val;
+                    variableLines[friendlyName] = i;
+
                     results[i] = {
                         value: val,
                         type: 'calc',
@@ -250,8 +362,11 @@ export const evaluateDocument = (fullText) => {
         const tag = extractTag(raw);
 
         if (looksLikeMath(expr)) {
-            const evalFn = buildEvaluator(scope);
-            const val = evalFn(expr);
+            // Substitute variable references before evaluation
+            const exprSubstituted = substituteVariables(exprRaw, fullScope);
+            const exprFinal = preprocessExpression(exprSubstituted);
+            const evalFn = buildEvaluator(mathScope);
+            const val = evalFn(exprFinal);
 
             if (Number.isFinite(val)) {
                 results[i] = {
@@ -273,5 +388,5 @@ export const evaluateDocument = (fullText) => {
         lineTags.push(tag);
     }
 
-    return results;
+    return { results, variables: fullScope, variableLines };
 };
