@@ -663,13 +663,28 @@ IMPORTANT:
                         };
                         currentValues[idx] = val;
 
-                        // Also add computed result to variableValues so later formulas can use it
-                        // Extract variable name from left side of "=" in original formula
+                        // Add computed result to variableValues so later formulas can use it
+                        // First try: Extract from left side of "=" in formula
                         const originalFormula = aiItem.formula;
                         if (originalFormula.includes('=')) {
                             const computedVarName = originalFormula.slice(0, originalFormula.indexOf('=')).trim();
                             if (computedVarName) {
                                 variableValues[computedVarName] = val;
+                            }
+                        }
+
+                        // Second try: Extract label from input line (e.g., "Total Fixed Costs: Sum of above")
+                        const inputLine = lines[idx];
+                        if (inputLine) {
+                            const colonIdx = inputLine.indexOf(':');
+                            if (colonIdx > 0) {
+                                const label = inputLine.slice(0, colonIdx).trim();
+                                variableValues[label] = val;
+                            }
+                            const eqIdx = inputLine.indexOf('=');
+                            if (eqIdx > 0) {
+                                const varName = inputLine.slice(0, eqIdx).trim();
+                                variableValues[varName] = val;
                             }
                         }
                     }
