@@ -1,7 +1,29 @@
+/**
+ * DebugPanel Component
+ * 
+ * A collapsible panel that displays debugging information for the LLM integration.
+ * Shows server connection status, last request/response, and a history of logs
+ * stored in IndexedDB.
+ * 
+ * Features:
+ * - Copy request/response to clipboard (with fallback for non-secure contexts)
+ * - Expandable log entries to view full data
+ * - Clear all logs functionality
+ * - Color-coded log types (LLM, error, info)
+ */
+
 import React, { useState, useEffect, useRef } from 'react';
 import { X, Trash2, Copy, ChevronDown, ChevronUp, Zap, Cloud, AlertCircle, CheckCircle } from 'lucide-react';
 import { getLogs, clearLogs } from '../lib/db';
 
+/**
+ * @param {Object} props
+ * @param {boolean} props.isOpen - Whether the panel is visible
+ * @param {function} props.onClose - Callback when close button is clicked
+ * @param {string} props.serverStatus - Current LLM server status ('connected', 'error', 'unknown')
+ * @param {Object} props.lastInput - The last request sent to the LLM
+ * @param {Object} props.lastOutput - The last response from the LLM
+ */
 const DebugPanel = ({ isOpen, onClose, serverStatus, lastInput, lastOutput }) => {
     const [logs, setLogs] = useState([]);
     const [expanded, setExpanded] = useState({});

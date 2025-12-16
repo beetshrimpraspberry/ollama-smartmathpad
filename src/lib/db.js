@@ -1,16 +1,37 @@
+/**
+ * Database Module (IndexedDB via Dexie.js)
+ * 
+ * This module provides persistence for the NeoCalc application using IndexedDB.
+ * Dexie.js is used as a wrapper for cleaner async/await API.
+ * 
+ * Database Schema:
+ * - files: User's calculation documents
+ * - settings: App preferences (future use)
+ * - logs: Debug logs for LLM requests/responses
+ * 
+ * @module lib/db
+ */
+
 import Dexie from 'dexie';
 
-// Initialize Dexie database
+// Initialize Dexie database instance
 const db = new Dexie('NeoCalcDB');
 
-// Define schema
+/**
+ * Database schema definition.
+ * - files: Auto-incrementing id, indexed by title and updatedAt
+ * - settings: Key-value store for app settings
+ * - logs: Auto-incrementing id, indexed by timestamp for sorting
+ */
 db.version(1).stores({
-    files: '++id, title, updatedAt', // id, title, content, aiLogic, updatedAt
-    settings: 'key', // key, value
-    logs: '++id, timestamp' // id, type, message, data, timestamp
+    files: '++id, title, updatedAt',
+    settings: 'key',
+    logs: '++id, timestamp'
 });
 
-// File operations
+// ============================================
+// FILE OPERATIONS
+// ============================================
 export const createFile = async (title = 'Untitled.calc', content = '') => {
     const id = await db.files.add({
         title,

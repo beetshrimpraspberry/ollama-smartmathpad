@@ -1,3 +1,18 @@
+/**
+ * NeoCalcUI - AI-Powered Smart Calculator
+ * 
+ * This is the main UI component for the NeoCalc application.
+ * It provides a document-based interface where users can write
+ * natural language math and get computed results.
+ * 
+ * Key Features:
+ * - Local evaluation engine for basic math
+ * - AI-powered logic extraction for complex expressions
+ * - Multi-file support with IndexedDB persistence
+ * - PWA capabilities (offline, installable)
+ * - Debug panel for monitoring LLM requests
+ */
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
     Plus, Search, Command, X, FolderOpen, Download,
@@ -5,19 +20,31 @@ import {
     ChevronRight, Save, MoreVertical, Terminal, Eye, EyeOff,
     Sidebar, PanelRight, Cloud, Zap, Copy, Scissors
 } from 'lucide-react';
+
+// Local modules
 import { createFile, saveFile, getFile, getAllFiles, renameFile, deleteFile, addLog } from './lib/db';
 import SplashScreen from './components/SplashScreen';
 import InstallPrompt from './components/InstallPrompt';
 import DebugPanel from './components/DebugPanel';
+import {
+    LOCAL_API_URL,
+    SAFE_FUNCS,
+    LLM_SYSTEM_PROMPT
+} from './utils/constants';
+import {
+    evaluateDocument,
+    extractTag,
+    classifyFormat
+} from './utils/evaluator';
+import { formatValue } from './utils/formatters';
 
-// --- THEME ---
+// ============================================
+// THEME CONSTANTS
+// ============================================
 const BG_STYLE = "bg-zinc-950 text-zinc-400 font-mono";
 const BORDER_COLOR = "border-zinc-800";
 const ACTIVE_TAB_COLOR = "bg-zinc-900 text-zinc-100 border-t-2 border-t-blue-500";
 const INACTIVE_TAB_COLOR = "bg-zinc-950 hover:bg-zinc-900 text-zinc-500";
-
-// --- LOCAL LLM CONFIG ---
-const LOCAL_API_URL = "http://localhost:8080/v1/chat/completions";
 
 // --- MOCK FILES ---
 const MOCK_FILES = [
@@ -56,13 +83,9 @@ Cash on Hand = $600,000
 Runway = Cash on Hand / Monthly Burn` },
 ];
 
-// --- SAFE MATH FUNCTIONS ---
-const SAFE_FUNCS = {
-    sqrt: Math.sqrt, abs: Math.abs, min: Math.min, max: Math.max,
-    round: (x, d = 0) => { const p = Math.pow(10, d); return Math.round(x * p) / p; },
-    floor: Math.floor, ceil: Math.ceil, pow: Math.pow,
-};
-
+// ============================================
+// MAIN COMPONENT
+// ============================================
 const NeoCalcUI = () => {
     // --- STATE ---
     const [isLoading, setIsLoading] = useState(true); // Splash screen
@@ -229,190 +252,15 @@ const NeoCalcUI = () => {
         return () => window.removeEventListener('keydown', handler);
     }, [currentFileId, text, aiLogic]);
 
-    // --- LOCAL EVALUATION ENGINE (copied from App.jsx) ---
-    const stripInlineComment = (s) => s.replace(/\/\/.*$/, '').trim();
-    const removeTags = (line) => line.replace(/#([A-Za-z][\w-]*)/g, '').trim();
+    // ============================================
+    // LLM API CALL
+    // ============================================
+    // Note: evaluateDocument, extractTag, classifyFormat are imported from utils/evaluator
 
-    const extractTag = (line) => {
-        const m1 = line.match(/\btag\s*:\s*([A-Za-z][\w-]*)/i);
-        if (m1) return m1[1].toLowerCase();
-        const m2 = line.match(/#([A-Za-z][\w-]*)/);
-        if (m2) return m2[1].toLowerCase();
-        return null;
-    };
-
-    const normalizeVarName = (raw) => raw.trim().replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || null;
-
-    const tokenizeNaturalGlue = (expr) => {
-        const glue = ['per', 'of', 'on', 'at', 'for', 'a', 'an', 'the', 'is', 'equals', 'equal'];
-        const re = new RegExp('\\b(' + glue.join('|') + ')\\b', 'gi');
-        return expr.replace(re, ' ');
-    };
-
-    const preprocessExpression = (expr) => {
-        let s = expr.trim();
-        s = s.replace(/×/g, '*').replace(/÷/g, '/').replace(/−/g, '-');
-        s = s.replace(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)/g, (_, num) => String(num).replace(/,/g, ''));
-        s = s.replace(/([0-9]+(?:\.[0-9]+)?)\s*%/g, '($1/100)');
-        s = s.replace(/\^/g, '**');
-        s = tokenizeNaturalGlue(s);
-        return s.replace(/\s+/g, ' ').trim();
-    };
-
-    const looksLikeMath = (s) => /[0-9$%]/.test(s) || /[+\-*/^()]/.test(s) || /\b(sqrt|abs|min|max|round|floor|ceil|pow|log|exp)\s*\(/i.test(s);
-
-    const buildEvaluator = (scope) => {
-        const names = [...Object.keys(SAFE_FUNCS), ...Object.keys(scope)];
-        const values = [...Object.values(SAFE_FUNCS), ...Object.values(scope)];
-        return (expr) => {
-            try {
-                const code = '"use strict"; return (' + expr + ');';
-                const fn = Function(...names, code);
-                return fn(...values);
-            } catch (e) { return null; }
-        };
-    };
-
-    const classifyFormat = (rawLine) => /\$/.test(rawLine) ? 'currency' : 'number';
-
-    const evaluateDocument = (fullText) => {
-        const lines = fullText.split('\n');
-        const scope = Object.create(null);
-        const lineValues = [];
-        const lineTags = [];
-        const results = {};
-
-        for (let i = 0; i < lines.length; i++) {
-            const raw = lines[i];
-            const trimmed = raw.trim();
-
-            // 1. Skip empty/comments
-            if (!trimmed || trimmed.startsWith('//')) {
-                lineValues.push(null);
-                lineTags.push(extractTag(raw));
-                continue;
-            }
-
-            // 2. Sum: Tag
-            const sumMatch = trimmed.match(/^sum\s*:\s*([A-Za-z][\w-]*)\s*$/i);
-            if (sumMatch) {
-                const tag = sumMatch[1].toLowerCase();
-                let sum = 0;
-                let count = 0;
-                for (let j = 0; j < i; j++) {
-                    if (lineTags[j] === tag && Number.isFinite(lineValues[j])) {
-                        sum += lineValues[j];
-                        count++;
-                    }
-                }
-                results[i] = {
-                    value: sum,
-                    type: 'total',
-                    format: 'number',
-                    explanation: count ? `Sum of #${tag}` : `No #${tag} found`,
-                    formula: `sum(${tag})`,
-                    source: 'local'
-                };
-                lineValues.push(sum);
-                lineTags.push(tag);
-                continue;
-            }
-
-            // 3. Assignment: Name = Expr
-            const eqIdx = trimmed.indexOf('=');
-            let isAssignment = false;
-
-            if (eqIdx > 0) {
-                const left = trimmed.slice(0, eqIdx);
-                const right = trimmed.slice(eqIdx + 1);
-                const varId = normalizeVarName(left);
-
-                if (varId && right.trim()) {
-                    const exprRaw = removeTags(stripInlineComment(right));
-                    const expr = preprocessExpression(exprRaw);
-                    const evalFn = buildEvaluator(scope);
-                    const val = evalFn(expr);
-
-                    if (Number.isFinite(val)) {
-                        scope[varId] = val;
-                        results[i] = {
-                            value: val,
-                            type: 'variable',
-                            format: classifyFormat(raw),
-                            explanation: `Set ${left.trim()}`,
-                            formula: exprRaw.trim(),
-                            source: 'local'
-                        };
-                        lineValues.push(val);
-                        lineTags.push(extractTag(raw));
-                        isAssignment = true;
-                    }
-                }
-            }
-
-            if (isAssignment) continue;
-
-            // 3.5. Explicit Label: Expression (e.g. "Flight: 1200")
-            const colonIdx = trimmed.indexOf(':');
-            if (colonIdx > 0) {
-                const left = trimmed.slice(0, colonIdx);
-                const right = trimmed.slice(colonIdx + 1);
-
-                const exprRaw = removeTags(stripInlineComment(right));
-                const expr = preprocessExpression(exprRaw);
-
-                if (looksLikeMath(expr)) {
-                    const evalFn = buildEvaluator(scope);
-                    const val = evalFn(expr);
-                    if (Number.isFinite(val)) {
-                        results[i] = {
-                            value: val,
-                            type: 'calc',
-                            format: classifyFormat(raw),
-                            explanation: left.trim(),
-                            formula: exprRaw.trim(),
-                            source: 'local'
-                        };
-                        lineValues.push(val);
-                        lineTags.push(extractTag(raw));
-                        continue;
-                    }
-                }
-            }
-
-            // 4. Standard Expression or Text
-            const exprRaw = removeTags(stripInlineComment(raw));
-            const expr = preprocessExpression(exprRaw);
-            const tag = extractTag(raw);
-
-            if (looksLikeMath(expr)) {
-                const evalFn = buildEvaluator(scope);
-                const val = evalFn(expr);
-
-                if (Number.isFinite(val)) {
-                    results[i] = {
-                        value: val,
-                        type: /\btotal\b/i.test(raw) ? 'total' : 'calc',
-                        format: classifyFormat(raw),
-                        explanation: tag ? `Tagged #${tag}` : '',
-                        formula: exprRaw.trim(),
-                        source: 'local'
-                    };
-                    lineValues.push(val);
-                    lineTags.push(tag);
-                    continue;
-                }
-            }
-
-            // Fallback: Text line (no value)
-            lineValues.push(null);
-            lineTags.push(tag);
-        }
-
-        return results;
-    };
-
-    // --- LLM CALL ---
+    /**
+     * Calls the local LLM server to extract logic from user input.
+     * This runs after a debounce delay when text changes.
+     */
     const callLocalLLM = async (inputText) => {
         if (!inputText.trim()) {
             setAiLogic({});
@@ -700,13 +548,7 @@ IMPORTANT:
         return () => clearTimeout(timer);
     }, [text]);
 
-    // --- FORMAT VALUE ---
-    const formatValue = (val, format) => {
-        if (!Number.isFinite(val)) return '';
-        if (format === 'currency') return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val);
-        if (format === 'percent') return (val * 100).toFixed(1) + '%';
-        return val.toLocaleString(undefined, { maximumFractionDigits: 2 });
-    };
+    // Note: formatValue is imported from utils/formatters
 
     const lines = text.split('\n');
 
