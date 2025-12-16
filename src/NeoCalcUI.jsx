@@ -329,6 +329,8 @@ const NeoCalcUI = () => {
         lines.forEach((line, idx) => {
             if (line.trim()) {
                 lineMap[idx] = line;
+
+                // Try = syntax first (e.g., "Rent = $1000")
                 const eqIdx = line.indexOf('=');
                 if (eqIdx > 0) {
                     const varName = line.slice(0, eqIdx).trim();
@@ -336,6 +338,19 @@ const NeoCalcUI = () => {
                     if (numMatch) {
                         const value = parseFloat(numMatch[1].replace(/,/g, ''));
                         if (!isNaN(value)) variables[varName] = { line: idx, value };
+                    }
+                }
+
+                // Also try : syntax (e.g., "Venue Rental: $15,000")
+                const colonIdx = line.indexOf(':');
+                if (colonIdx > 0 && !line.match(/^(sum|tag|http|https)\s*:/i)) {
+                    const varName = line.slice(0, colonIdx).trim();
+                    const numMatch = line.slice(colonIdx + 1).match(/\$?\s*([\d,]+(?:\.\d+)?)/);
+                    if (numMatch) {
+                        const value = parseFloat(numMatch[1].replace(/,/g, ''));
+                        if (!isNaN(value) && !variables[varName]) {
+                            variables[varName] = { line: idx, value };
+                        }
                     }
                 }
             }
