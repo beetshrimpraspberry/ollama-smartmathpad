@@ -229,85 +229,185 @@ const NeoCalcUI = () => {
         return () => window.removeEventListener('keydown', handler);
     }, [currentFileId, text, aiLogic]);
 
-    // --- LOCAL EVALUATION ENGINE ---
-    const evaluateDocument = (inputText) => {
-        const lines = inputText.split('\n');
-        const results = {};
-        const variables = {};
-        const taggedValues = {};
+    // --- LOCAL EVALUATION ENGINE (copied from App.jsx) ---
+    const stripInlineComment = (s) => s.replace(/\/\/.*$/, '').trim();
+    const removeTags = (line) => line.replace(/#([A-Za-z][\w-]*)/g, '').trim();
 
-        const preprocessExpression = (expr) => {
-            let s = expr.trim();
-            s = s.replace(/×/g, '*').replace(/÷/g, '/').replace(/−/g, '-');
-            s = s.replace(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)/g, (_, num) => String(num).replace(/,/g, ''));
-            s = s.replace(/([0-9]+(?:\.[0-9]+)?)\s*%/g, '($1/100)');
-            s = s.replace(/\^/g, '**');
-            return s;
-        };
+    const extractTag = (line) => {
+        const m1 = line.match(/\btag\s*:\s*([A-Za-z][\w-]*)/i);
+        if (m1) return m1[1].toLowerCase();
+        const m2 = line.match(/#([A-Za-z][\w-]*)/);
+        if (m2) return m2[1].toLowerCase();
+        return null;
+    };
 
-        const extractTag = (line) => {
-            const m = line.match(/#([A-Za-z][\w-]*)/);
-            return m ? m[1].toLowerCase() : null;
-        };
+    const normalizeVarName = (raw) => raw.trim().replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || null;
 
-        const safeEval = (expr, localVars) => {
+    const tokenizeNaturalGlue = (expr) => {
+        const glue = ['per', 'of', 'on', 'at', 'for', 'a', 'an', 'the', 'is', 'equals', 'equal'];
+        const re = new RegExp('\\b(' + glue.join('|') + ')\\b', 'gi');
+        return expr.replace(re, ' ');
+    };
+
+    const preprocessExpression = (expr) => {
+        let s = expr.trim();
+        s = s.replace(/×/g, '*').replace(/÷/g, '/').replace(/−/g, '-');
+        s = s.replace(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)/g, (_, num) => String(num).replace(/,/g, ''));
+        s = s.replace(/([0-9]+(?:\.[0-9]+)?)\s*%/g, '($1/100)');
+        s = s.replace(/\^/g, '**');
+        s = tokenizeNaturalGlue(s);
+        return s.replace(/\s+/g, ' ').trim();
+    };
+
+    const looksLikeMath = (s) => /[0-9$%]/.test(s) || /[+\-*/^()]/.test(s) || /\b(sqrt|abs|min|max|round|floor|ceil|pow|log|exp)\s*\(/i.test(s);
+
+    const buildEvaluator = (scope) => {
+        const names = [...Object.keys(SAFE_FUNCS), ...Object.keys(scope)];
+        const values = [...Object.values(SAFE_FUNCS), ...Object.values(scope)];
+        return (expr) => {
             try {
-                const fn = new Function(...Object.keys(localVars), ...Object.keys(SAFE_FUNCS), `return (${expr})`);
-                return fn(...Object.values(localVars), ...Object.values(SAFE_FUNCS));
-            } catch { return null; }
+                const code = '"use strict"; return (' + expr + ');';
+                const fn = Function(...names, code);
+                return fn(...values);
+            } catch (e) { return null; }
         };
+    };
 
-        lines.forEach((rawLine, idx) => {
-            const line = rawLine.trim();
-            if (!line || line.startsWith('#') || line.startsWith('//')) return;
+    const classifyFormat = (rawLine) => /\$/.test(rawLine) ? 'currency' : 'number';
 
-            const tag = extractTag(rawLine);
-            const cleanLine = rawLine.replace(/#([A-Za-z][\w-]*)/g, '').trim();
+    const evaluateDocument = (fullText) => {
+        const lines = fullText.split('\n');
+        const scope = Object.create(null);
+        const lineValues = [];
+        const lineTags = [];
+        const results = {};
 
-            // Variable assignment: Name = Expression
-            const eqIdx = cleanLine.indexOf('=');
-            if (eqIdx > 0) {
-                const varName = cleanLine.slice(0, eqIdx).trim();
-                const rightSide = preprocessExpression(cleanLine.slice(eqIdx + 1));
-                const val = safeEval(rightSide, variables);
-                if (val !== null && Number.isFinite(val)) {
-                    variables[varName] = val;
-                    results[idx] = { value: val, type: 'variable', format: 'number', expression: rightSide };
-                    if (tag) taggedValues[tag] = (taggedValues[tag] || 0) + val;
-                }
-                return;
+        for (let i = 0; i < lines.length; i++) {
+            const raw = lines[i];
+            const trimmed = raw.trim();
+
+            // 1. Skip empty/comments
+            if (!trimmed || trimmed.startsWith('//')) {
+                lineValues.push(null);
+                lineTags.push(extractTag(raw));
+                continue;
             }
 
-            // Labeled value: Label: Value
-            const colonIdx = cleanLine.indexOf(':');
-            if (colonIdx > 0 && !cleanLine.match(/^(sum|tag)\s*:/i)) {
-                const label = cleanLine.slice(0, colonIdx).trim();
-                const rightSide = preprocessExpression(cleanLine.slice(colonIdx + 1));
-                const val = safeEval(rightSide, variables);
-                if (val !== null && Number.isFinite(val)) {
-                    variables[label] = val;
-                    results[idx] = { value: val, type: 'variable', format: 'number', expression: rightSide };
-                    if (tag) taggedValues[tag] = (taggedValues[tag] || 0) + val;
-                }
-                return;
-            }
-
-            // Sum by tag: sum: tagname
-            const sumMatch = cleanLine.match(/^sum\s*:\s*(\w+)/i);
+            // 2. Sum: Tag
+            const sumMatch = trimmed.match(/^sum\s*:\s*([A-Za-z][\w-]*)\s*$/i);
             if (sumMatch) {
-                const tagName = sumMatch[1].toLowerCase();
-                const val = taggedValues[tagName] || 0;
-                results[idx] = { value: val, type: 'total', format: 'currency', expression: `sum(${tagName})` };
-                return;
+                const tag = sumMatch[1].toLowerCase();
+                let sum = 0;
+                let count = 0;
+                for (let j = 0; j < i; j++) {
+                    if (lineTags[j] === tag && Number.isFinite(lineValues[j])) {
+                        sum += lineValues[j];
+                        count++;
+                    }
+                }
+                results[i] = {
+                    value: sum,
+                    type: 'total',
+                    format: 'number',
+                    explanation: count ? `Sum of #${tag}` : `No #${tag} found`,
+                    formula: `sum(${tag})`,
+                    source: 'local'
+                };
+                lineValues.push(sum);
+                lineTags.push(tag);
+                continue;
             }
 
-            // Standalone expression
-            const expr = preprocessExpression(cleanLine);
-            const val = safeEval(expr, variables);
-            if (val !== null && Number.isFinite(val)) {
-                results[idx] = { value: val, type: 'calc', format: 'number', expression: expr };
+            // 3. Assignment: Name = Expr
+            const eqIdx = trimmed.indexOf('=');
+            let isAssignment = false;
+
+            if (eqIdx > 0) {
+                const left = trimmed.slice(0, eqIdx);
+                const right = trimmed.slice(eqIdx + 1);
+                const varId = normalizeVarName(left);
+
+                if (varId && right.trim()) {
+                    const exprRaw = removeTags(stripInlineComment(right));
+                    const expr = preprocessExpression(exprRaw);
+                    const evalFn = buildEvaluator(scope);
+                    const val = evalFn(expr);
+
+                    if (Number.isFinite(val)) {
+                        scope[varId] = val;
+                        results[i] = {
+                            value: val,
+                            type: 'variable',
+                            format: classifyFormat(raw),
+                            explanation: `Set ${left.trim()}`,
+                            formula: exprRaw.trim(),
+                            source: 'local'
+                        };
+                        lineValues.push(val);
+                        lineTags.push(extractTag(raw));
+                        isAssignment = true;
+                    }
+                }
             }
-        });
+
+            if (isAssignment) continue;
+
+            // 3.5. Explicit Label: Expression (e.g. "Flight: 1200")
+            const colonIdx = trimmed.indexOf(':');
+            if (colonIdx > 0) {
+                const left = trimmed.slice(0, colonIdx);
+                const right = trimmed.slice(colonIdx + 1);
+
+                const exprRaw = removeTags(stripInlineComment(right));
+                const expr = preprocessExpression(exprRaw);
+
+                if (looksLikeMath(expr)) {
+                    const evalFn = buildEvaluator(scope);
+                    const val = evalFn(expr);
+                    if (Number.isFinite(val)) {
+                        results[i] = {
+                            value: val,
+                            type: 'calc',
+                            format: classifyFormat(raw),
+                            explanation: left.trim(),
+                            formula: exprRaw.trim(),
+                            source: 'local'
+                        };
+                        lineValues.push(val);
+                        lineTags.push(extractTag(raw));
+                        continue;
+                    }
+                }
+            }
+
+            // 4. Standard Expression or Text
+            const exprRaw = removeTags(stripInlineComment(raw));
+            const expr = preprocessExpression(exprRaw);
+            const tag = extractTag(raw);
+
+            if (looksLikeMath(expr)) {
+                const evalFn = buildEvaluator(scope);
+                const val = evalFn(expr);
+
+                if (Number.isFinite(val)) {
+                    results[i] = {
+                        value: val,
+                        type: /\btotal\b/i.test(raw) ? 'total' : 'calc',
+                        format: classifyFormat(raw),
+                        explanation: tag ? `Tagged #${tag}` : '',
+                        formula: exprRaw.trim(),
+                        source: 'local'
+                    };
+                    lineValues.push(val);
+                    lineTags.push(tag);
+                    continue;
+                }
+            }
+
+            // Fallback: Text line (no value)
+            lineValues.push(null);
+            lineTags.push(tag);
+        }
 
         return results;
     };
